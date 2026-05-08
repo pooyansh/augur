@@ -3,18 +3,27 @@
 Phase 1 throwaway CLI for probing the Polymarket public API. No auth required for read-only
 subcommands. Raw captures land in `scout/runs/` (gitignored).
 
-## Setup
+## Setup (uv)
 
 ```bash
 cd scout
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv venv                       # creates .venv with the system Python 3.12
+source .venv/bin/activate      # so uv targets the local venv, not conda
+uv pip install -r requirements.txt
 ```
 
-## Subcommands
+If you don't want to activate, set `VIRTUAL_ENV` for the install step:
 
-All run as `python polymarket_scout.py <subcmd> [args]`.
+```bash
+VIRTUAL_ENV="$PWD/.venv" uv pip install -r requirements.txt
+```
+
+## Running
+
+With the venv active, `python polymarket_scout.py <subcmd>` works directly.
+Without activating, run via the venv's interpreter: `.venv/bin/python polymarket_scout.py <subcmd>`.
+
+## Subcommands
 
 ```
 list-markets              List active markets from Gamma API
