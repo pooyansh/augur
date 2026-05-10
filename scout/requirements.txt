@@ -1,0 +1,5 @@
+httpx[http2]==0.28.1
+websockets==14.1
+orjson==3.10.12
+pydantic==2.10.4
+tenacity==9.0.0

@@ -24,7 +24,11 @@ The index is grouped by topic. Add new entries under the right heading; create n
 
 ### Polymarket
 
-_(empty — populated during Phase 1)_
+- [Polymarket API shape](polymarket-api-shape.md) — 2026-05-08 — endpoints, identifier model `(condition_id, token_id)`, JSON-string-encoded array fields, snake_case (CLOB) vs camelCase (Gamma), two distinct WS shapes
+- [Polymarket errors and rate limits](polymarket-errors-and-rate-limits.md) — 2026-05-08 — error shapes are **not** uniform (JSON object on routed endpoints, plain text on catch-all 404), `/trades` is auth-gated, no 429 at 50 req/10 concurrency
+- [Polymarket paper-mode backend — tentative](polymarket-paper-mode-decision.md) — 2026-05-08 — tentative decision: in-process simulator fed by live mainnet data; testnet pass deferred until wallet probe
+- [Polymarket auth and signing](polymarket-auth-and-signing.md) — 2026-05-09 — SDK-source-only — two-tier auth (L1 EOA EIP-712 + L2 HMAC); 12-field `Order` struct; minimum `OrderIntent` field set locked
+- [Polymarket idempotency and cancels](polymarket-idempotency-and-cancels.md) — 2026-05-09 — SDK-source-only — `salt` is the only `client_order_id` analogue (random by default; can be made deterministic); 4 cancel methods, all REST DELETE w/ L2 HMAC, no signed cancels
 
 ### Kalshi
 
