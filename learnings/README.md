@@ -29,6 +29,7 @@ The index is grouped by topic. Add new entries under the right heading; create n
 - [Polymarket paper-mode backend — tentative](polymarket-paper-mode-decision.md) — 2026-05-08 — tentative decision: in-process simulator fed by live mainnet data; testnet pass deferred until wallet probe
 - [Polymarket auth and signing](polymarket-auth-and-signing.md) — 2026-05-09 — SDK-source-only — two-tier auth (L1 EOA EIP-712 + L2 HMAC); 12-field `Order` struct; minimum `OrderIntent` field set locked
 - [Polymarket idempotency and cancels](polymarket-idempotency-and-cancels.md) — 2026-05-09 — SDK-source-only — `salt` is the only `client_order_id` analogue (random by default; can be made deterministic); 4 cancel methods, all REST DELETE w/ L2 HMAC, no signed cancels
+- [Polymarket settlement on the wire](polymarket-settlement.md) — 2026-05-09 — closes Phase 1 exit #7; Gamma `outcomePrices` (JSON-string) is the payout source, `closedTime`/`umaResolutionStatus="resolved"` is the settlement signal, `active` is sticky on close
 
 ### Kalshi
 
