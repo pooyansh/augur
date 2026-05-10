@@ -9,9 +9,11 @@ Usage: python polymarket_scout.py <subcommand> [args]
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -34,10 +36,21 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 RUNS_DIR = Path(__file__).parent / "runs"
 
+# Default key file path; overridden by POLYMARKET_SCOUT_KEYFILE env var.
+_DEFAULT_KEYFILE = Path.home() / ".polymarket-scout" / "disposable.key"
+
+# USDC.e on Polygon mainnet
+_POLYGON_USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+# Keys whose values must be redacted from captured payloads.
+_SENSITIVE_KEYS: frozenset[str] = frozenset(
+    ["signature", "private_key", "api_secret", "passphrase"]
+)
+
 # ---------------------------------------------------------------------------
 # Redaction filter — masks any value from env vars matching POLYMARKET_*_KEY
-# or *_PRIVATE_*. In Phase 1 we have no keys, but the wiring is mandatory per
-# the plan's "one piece of production hygiene we keep".
+# or *_PRIVATE_*.  Extended at runtime by _extend_redaction_patterns() when
+# a key or derived API creds are loaded.
 # ---------------------------------------------------------------------------
 
 def _build_redaction_patterns() -> list[re.Pattern[str]]:
@@ -49,6 +62,17 @@ def _build_redaction_patterns() -> list[re.Pattern[str]]:
 
 
 _REDACT_PATTERNS: list[re.Pattern[str]] = _build_redaction_patterns()
+
+
+def _extend_redaction_patterns(*values: str) -> None:
+    """Add additional literal string values to the redaction set at runtime.
+
+    Args:
+        *values: Plain-text strings (private keys, secrets, etc.) to mask.
+    """
+    for v in values:
+        if v and v not in ("", "***REDACTED***"):
+            _REDACT_PATTERNS.append(re.compile(re.escape(v)))
 
 
 class RedactionFilter(logging.Filter):
@@ -97,13 +121,39 @@ def _open_capture(subcmd: str) -> tuple[Path, Any]:
     return path, fh
 
 
+def _redact_payload(body: Any) -> Any:
+    """Walk a dict/list and redact values for sensitive keys.
+
+    Replaces any value whose key (case-insensitive) is in _SENSITIVE_KEYS with
+    the string ``***REDACTED***``.  Non-dict/list leaves are returned unchanged.
+
+    Args:
+        body: Arbitrary JSON-serialisable value.
+
+    Returns:
+        A copy of body with sensitive fields replaced.
+    """
+    if isinstance(body, dict):
+        return {
+            k: "***REDACTED***" if k.lower() in _SENSITIVE_KEYS else _redact_payload(v)
+            for k, v in body.items()
+        }
+    if isinstance(body, list):
+        return [_redact_payload(item) for item in body]
+    return body
+
+
 def _write_capture(fh: Any, capture: CapturedRequest) -> None:
     line = orjson.dumps({
         "ts": capture.ts,
-        "request": {"method": capture.method, "url": capture.url, "body": capture.request_body},
+        "request": {
+            "method": capture.method,
+            "url": capture.url,
+            "body": _redact_payload(capture.request_body),
+        },
         "response_status": capture.response_status,
         "response_headers": capture.response_headers,
-        "response_body": capture.response_body,
+        "response_body": _redact_payload(capture.response_body),
         "latency_ms": capture.latency_ms,
     }) + b"\n"
     fh.write(line)
@@ -186,6 +236,69 @@ def _new_client() -> httpx.AsyncClient:
     # http2=True: Polymarket's CLOB CDN supports HTTP/2; reduces connection overhead
     # on repeated requests during bursts and streaming probes.
     return httpx.AsyncClient(http2=True, timeout=30.0)
+
+
+# ---------------------------------------------------------------------------
+# Key-file helpers (shared across signing subcommands)
+# ---------------------------------------------------------------------------
+
+def _keyfile_path() -> Path:
+    """Return the resolved key-file path from env or default.
+
+    Returns:
+        Path object for the key file.
+    """
+    env_val = os.environ.get("POLYMARKET_SCOUT_KEYFILE", "")
+    if env_val:
+        return Path(env_val).expanduser()
+    return _DEFAULT_KEYFILE
+
+
+def _load_private_key() -> str:
+    """Load hex private key from keyfile, enforcing mode 0600.
+
+    Returns:
+        Hex private key string (with or without 0x prefix).
+
+    Raises:
+        SystemExit: If file missing, wrong permissions, or content invalid.
+    """
+    kf = _keyfile_path()
+    if not kf.exists():
+        print(
+            f"ERROR: Key file not found: {kf}\n"
+            "Run `init-wallet` first, or set POLYMARKET_SCOUT_KEYFILE.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    file_stat = kf.stat()
+    mode = stat.S_IMODE(file_stat.st_mode)
+    if mode != 0o600:
+        print(
+            f"ERROR: Key file {kf} has permissions {oct(mode)}, expected 0600.\n"
+            "Fix with: chmod 600 " + str(kf),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    raw = kf.read_text().strip()
+    if not raw:
+        print(f"ERROR: Key file {kf} is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    return raw
+
+
+def _apikeys_path() -> Path:
+    """Return path for storing derived API keys (sibling of keyfile).
+
+    Returns:
+        Path object for the .apikeys.json file.
+    """
+    kf = _keyfile_path()
+    stem = kf.stem  # e.g. "disposable" from "disposable.key"
+    return kf.parent / f"{stem}.apikeys.json"
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +730,932 @@ async def cmd_probe_rate_limit(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: init-wallet
+# ---------------------------------------------------------------------------
+
+def cmd_init_wallet(args: argparse.Namespace) -> None:
+    """Generate a fresh disposable EOA and write the private key to keyfile.
+
+    Refuses to overwrite an existing keyfile unless ``--force`` is passed.
+    Prints the wallet address plus a safety banner.
+
+    Args:
+        args: Parsed arguments.  Reads ``args.force``.
+    """
+    from eth_account import Account  # noqa: PLC0415
+
+    kf = _keyfile_path()
+
+    if kf.exists() and not args.force:
+        print(
+            f"ERROR: Key file already exists: {kf}\n"
+            "Use --force to overwrite (existing key will be lost!).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Ensure parent directory exists with mode 0700.
+    kf.parent.mkdir(parents=True, exist_ok=True)
+    kf.parent.chmod(0o700)
+
+    account = Account.create()
+    private_key_hex: str = account.key.hex()  # "0x..." 32-byte hex
+
+    # Write key file with mode 0600 (owner read/write only).
+    kf.touch(mode=0o600, exist_ok=True)
+    kf.write_text(private_key_hex)
+    kf.chmod(0o600)
+
+    address: str = account.address
+
+    print(f"\nWallet address : {address}")
+    print(f"Key file       : {kf}")
+    print()
+    print("=" * 72)
+    print("  DISPOSABLE WALLET — READ CAREFULLY")
+    print("=" * 72)
+    print("  * This key is for Phase 1 scouting ONLY.")
+    print("  * Hard cap: deposit no more than $10 of MATIC/USDC on mainnet.")
+    print("  * NEVER reuse this key for any production bot or wallet.")
+    print("  * NEVER commit this key to git, paste it in Slack, or share it.")
+    print("  * The key file is stored at:", kf)
+    print("=" * 72)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: wallet-info
+# ---------------------------------------------------------------------------
+
+async def cmd_wallet_info(args: argparse.Namespace) -> None:
+    """Load keyfile and print address.  Optionally fetches MATIC + USDC balance.
+
+    Args:
+        args: Parsed arguments.  Reads ``args.rpc`` and ``args.usdc``.
+    """
+    from eth_account import Account  # noqa: PLC0415
+
+    private_key = _load_private_key()
+    # Register key in redaction so it never leaks into logs.
+    _extend_redaction_patterns(private_key, private_key.lstrip("0x"))
+
+    account = Account.from_key(private_key)
+    address: str = account.address
+
+    print(f"Wallet address : {address}")
+    print(f"Key file       : {_keyfile_path()}")
+
+    rpc_url: str | None = args.rpc
+    if not rpc_url:
+        print("(Pass --rpc <url> to fetch on-chain balances)")
+        return
+
+    # Lazy import web3 only when --rpc is provided.
+    from web3 import Web3  # noqa: PLC0415
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    if not w3.is_connected():
+        print(f"ERROR: Cannot connect to RPC at {rpc_url}", file=sys.stderr)
+        sys.exit(1)
+
+    matic_wei = w3.eth.get_balance(address)
+    matic = matic_wei / 10**18
+    print(f"MATIC balance  : {matic:.6f}")
+
+    usdc_address: str = args.usdc or _POLYGON_USDC_ADDRESS
+    # Minimal ERC-20 ABI: just balanceOf.
+    erc20_abi: list[dict[str, Any]] = [
+        {
+            "inputs": [{"name": "account", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+    usdc_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(usdc_address), abi=erc20_abi
+    )
+    usdc_raw: int = usdc_contract.functions.balanceOf(address).call()
+    # USDC.e on Polygon has 6 decimals.
+    usdc_balance = usdc_raw / 10**6
+    print(f"USDC balance   : {usdc_balance:.6f}  (contract: {usdc_address})")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: derive-api-keys
+# ---------------------------------------------------------------------------
+
+def cmd_derive_api_keys(args: argparse.Namespace) -> None:
+    """Derive (or create) L2 API credentials via py-clob-client.
+
+    Stores results at ``<keyfile-stem>.apikeys.json`` (mode 0600).
+    Prints only the first 8 chars of api_key plus the wallet address.
+
+    Args:
+        args: Parsed arguments.  Reads ``args.host`` and ``args.chain_id``.
+    """
+    from py_clob_client.client import ClobClient  # noqa: PLC0415
+    from py_clob_client.exceptions import PolyException  # noqa: PLC0415
+
+    private_key = _load_private_key()
+    _extend_redaction_patterns(private_key, private_key.lstrip("0x"))
+
+    host: str = args.host
+    chain_id: int = args.chain_id
+
+    log.info("Connecting to CLOB host=%s chain_id=%d", host, chain_id)
+
+    try:
+        # Level-1 client: key only, no creds yet.
+        client = ClobClient(host=host, chain_id=chain_id, key=private_key)
+        address = client.get_address()
+        # Extend redaction with the wallet address (treat as PII).
+        _extend_redaction_patterns(address, address.lower() if address else "")
+
+        log.info("Deriving API keys for address=%s", address)
+        creds = client.create_or_derive_api_creds()
+    except PolyException as exc:
+        print(f"ERROR: CLOB returned an error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: Unexpected error during key derivation: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if creds is None:
+        print("ERROR: Received null credentials from CLOB.", file=sys.stderr)
+        sys.exit(1)
+
+    # Extend redaction with the derived L2 secret material.
+    _extend_redaction_patterns(creds.api_secret, creds.api_passphrase, creds.api_key)
+
+    # Persist to disk, mode 0600.
+    out_path = _apikeys_path()
+    payload = {
+        "api_key": creds.api_key,
+        "api_secret": creds.api_secret,
+        "api_passphrase": creds.api_passphrase,
+        "address": address,
+        "host": host,
+        "chain_id": chain_id,
+    }
+    out_path.touch(mode=0o600, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2))
+    out_path.chmod(0o600)
+
+    key_prefix = creds.api_key[:8] if creds.api_key else "?"
+    print(f"API key prefix : {key_prefix}...")
+    print(f"Wallet address : {address}")
+    print(f"Keys stored at : {out_path}")
+    log.info("API credentials saved (redacted from logs)")
+
+
+# ---------------------------------------------------------------------------
+# Internal: load stored API creds (used by place-resting-order, cancel-order, etc.)
+# ---------------------------------------------------------------------------
+
+def _load_api_creds() -> tuple[str, str, str, str, str]:
+    """Load private key and stored API creds from disk.
+
+    Returns:
+        Tuple of (private_key, api_key, api_secret, api_passphrase, address).
+
+    Raises:
+        SystemExit: If key file or apikeys file is missing/unreadable.
+    """
+    from py_clob_client.clob_types import ApiCreds  # noqa: PLC0415
+
+    private_key = _load_private_key()
+    _extend_redaction_patterns(private_key, private_key.lstrip("0x"))
+
+    ap = _apikeys_path()
+    if not ap.exists():
+        print(
+            f"ERROR: API keys file not found: {ap}\n"
+            "Run `derive-api-keys` first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    raw = json.loads(ap.read_text())
+    api_key: str = raw["api_key"]
+    api_secret: str = raw["api_secret"]
+    api_passphrase: str = raw["api_passphrase"]
+    address: str = raw.get("address", "")
+
+    _extend_redaction_patterns(api_key, api_secret, api_passphrase, address, address.lower())
+    return private_key, api_key, api_secret, api_passphrase, address
+
+
+def _build_level2_client(
+    private_key: str,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
+    host: str,
+    chain_id: int,
+) -> Any:
+    """Construct a Level-2 ClobClient.
+
+    Args:
+        private_key: Hex private key.
+        api_key: CLOB API key.
+        api_secret: CLOB API secret.
+        api_passphrase: CLOB API passphrase.
+        host: CLOB host URL.
+        chain_id: Polygon chain ID (137 mainnet, 80002 Amoy).
+
+    Returns:
+        Configured ClobClient instance.
+    """
+    from py_clob_client.client import ClobClient  # noqa: PLC0415
+    from py_clob_client.clob_types import ApiCreds  # noqa: PLC0415
+
+    creds = ApiCreds(
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_passphrase,
+    )
+    return ClobClient(
+        host=host,
+        chain_id=chain_id,
+        key=private_key,
+        creds=creds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: place-resting-order
+# ---------------------------------------------------------------------------
+
+def cmd_place_resting_order(args: argparse.Namespace) -> None:
+    """Place a limit order well off the touch; captures EIP-712 struct + response.
+
+    Safety guards:
+    - Hard cap: price * size <= 5 USDC notional.
+    - BUY price <= 0.20; SELL price >= 0.80 (override with --allow-near-touch).
+    - Price must be at least N ticks away from the current best; rejects if not.
+
+    Args:
+        args: Parsed arguments.
+    """
+    from py_clob_client.client import ClobClient  # noqa: PLC0415
+    from py_clob_client.clob_types import OrderArgs  # noqa: PLC0415
+    from py_clob_client.exceptions import PolyException  # noqa: PLC0415
+
+    private_key, api_key, api_secret, api_passphrase, address = _load_api_creds()
+
+    token_id: str = args.token_id
+    side: str = args.side.upper()
+    price: float = float(args.price)
+    size: float = float(args.size)
+    host: str = args.host
+    chain_id: int = args.chain_id
+
+    # Hard notional cap: 5 USDC.
+    notional = price * size
+    if notional > 5.0:
+        print(
+            f"ERROR: Notional {notional:.4f} USDC exceeds hard cap of 5 USDC.\n"
+            f"  price={price}  size={size}  price*size={notional:.4f}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Safety price checks.
+    if side == "BUY" and price > 0.20 and not args.allow_near_touch:
+        print(
+            f"WARNING: BUY price {price} is above the safe default of 0.20.\n"
+            "Pass --allow-near-touch to override (order may fill!).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if side == "SELL" and price < 0.80 and not args.allow_near_touch:
+        print(
+            f"WARNING: SELL price {price} is below the safe default of 0.80.\n"
+            "Pass --allow-near-touch to override (order may fill!).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    client = _build_level2_client(private_key, api_key, api_secret, api_passphrase, host, chain_id)
+
+    # Fetch current best to verify distance from touch.
+    try:
+        tick_size_str: str = client.get_tick_size(token_id)
+        tick_size = float(tick_size_str)
+    except Exception as exc:
+        print(f"ERROR: Could not fetch tick size: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # We require the order to be at least 5 ticks away from touch (configurable floor).
+    _MIN_TICKS_FROM_TOUCH = 5
+    try:
+        book = client.get_order_book(token_id)
+    except Exception as exc:
+        print(f"WARNING: Could not fetch orderbook to validate distance from touch: {exc}",
+              file=sys.stderr)
+        book = None
+
+    if book is not None:
+        if side == "BUY" and book.asks:
+            best_ask = float(book.asks[0].price)
+            distance = best_ask - price
+            if distance < _MIN_TICKS_FROM_TOUCH * tick_size:
+                print(
+                    f"ERROR: BUY price {price} is only {distance:.4f} from best ask {best_ask} "
+                    f"(need >= {_MIN_TICKS_FROM_TOUCH * tick_size:.4f} = {_MIN_TICKS_FROM_TOUCH} ticks).\n"
+                    "Increase distance or use --allow-near-touch.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif side == "SELL" and book.bids:
+            best_bid = float(book.bids[0].price)
+            distance = price - best_bid
+            if distance < _MIN_TICKS_FROM_TOUCH * tick_size:
+                print(
+                    f"ERROR: SELL price {price} is only {distance:.4f} from best bid {best_bid} "
+                    f"(need >= {_MIN_TICKS_FROM_TOUCH * tick_size:.4f} = {_MIN_TICKS_FROM_TOUCH} ticks).\n"
+                    "Increase distance or use --allow-near-touch.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    cap_path, fh = _open_capture("place-resting-order")
+    log.info(
+        "Placing resting %s order: token_id=%s price=%s size=%s notional=%.4f, capture=%s",
+        side, token_id, price, size, notional, cap_path,
+    )
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side=side,
+    )
+
+    try:
+        # create_order returns a SignedOrder; capture its dict() before submitting.
+        signed_order = client.create_order(order_args)
+    except PolyException as exc:
+        print(f"ERROR: Order creation failed: {exc}", file=sys.stderr)
+        fh.close()
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: Unexpected error building order: {exc}", file=sys.stderr)
+        fh.close()
+        sys.exit(1)
+
+    # Capture the full constructed EIP-712 order dict BEFORE signing field is exposed.
+    # signed_order.order.dict() has the struct fields; signed_order.dict() adds signature.
+    raw_order_struct: dict[str, Any] = signed_order.order.dict()
+    # signed_order.dict() includes the signature — redact it via _redact_payload.
+    order_with_sig: dict[str, Any] = signed_order.dict()
+
+    pre_sign_capture: dict[str, Any] = {
+        "event": "pre_submit_order_struct",
+        "note": "EIP-712 typed-data message fields (signature redacted)",
+        "order_struct": raw_order_struct,  # no signature field here
+        "signed_order_redacted": _redact_payload(order_with_sig),
+    }
+    pre_sign_line = orjson.dumps(pre_sign_capture) + b"\n"
+    fh.write(pre_sign_line)
+    fh.flush()
+
+    # Post the order via the SDK (which uses its own requests session internally).
+    # We capture what we can; the SDK does the HTTP itself so we reconstruct a capture entry.
+    from py_clob_client.constants import OrderType  # noqa: PLC0415
+
+    t0 = time.perf_counter()
+    try:
+        result = client.post_order(signed_order)
+    except PolyException as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        error_body: dict[str, Any] = {"error": str(exc)}
+        # Attempt to extract underlying HTTP body from PolyException.
+        if hasattr(exc, "args") and exc.args:
+            try:
+                error_body = json.loads(exc.args[0]) if isinstance(exc.args[0], str) else {"error": str(exc)}
+            except Exception:
+                error_body = {"error": str(exc)}
+        capture = CapturedRequest(
+            url=f"{host}/order",
+            method="POST",
+            request_body=_redact_payload(order_with_sig),
+            response_status=400,
+            response_headers={},
+            response_body=_redact_payload(error_body),
+            latency_ms=latency_ms,
+        )
+        _write_capture(fh, capture)
+        fh.close()
+        print(f"ERROR: Post order failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        capture = CapturedRequest(
+            url=f"{host}/order",
+            method="POST",
+            request_body=_redact_payload(order_with_sig),
+            response_status=0,
+            response_headers={},
+            response_body={"error": str(exc)},
+            latency_ms=latency_ms,
+        )
+        _write_capture(fh, capture)
+        fh.close()
+        print(f"ERROR: Unexpected error posting order: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+    capture = CapturedRequest(
+        url=f"{host}/order",
+        method="POST",
+        request_body=_redact_payload(order_with_sig),
+        response_status=200,
+        response_headers={},
+        response_body=_redact_payload(result) if isinstance(result, dict) else str(result),
+        latency_ms=latency_ms,
+    )
+    _write_capture(fh, capture)
+    fh.close()
+
+    order_id: str = result.get("orderID", "") if isinstance(result, dict) else ""
+    status_val: str = result.get("status", "") if isinstance(result, dict) else str(result)
+
+    print(f"order_id : {order_id}")
+    print(f"status   : {status_val}")
+    print(f"\n[Captured to {cap_path}]")
+
+    if not order_id:
+        log.warning("No order_id in response; check capture for details.")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: cancel-order
+# ---------------------------------------------------------------------------
+
+def cmd_cancel_order(args: argparse.Namespace) -> None:
+    """Cancel an order by ID.  Sends the cancel twice to observe idempotency.
+
+    Args:
+        args: Parsed arguments.  Reads ``args.order_id``, ``args.host``,
+              ``args.chain_id``.
+    """
+    from py_clob_client.exceptions import PolyException  # noqa: PLC0415
+
+    private_key, api_key, api_secret, api_passphrase, address = _load_api_creds()
+    order_id: str = args.order_id
+    host: str = args.host
+    chain_id: int = args.chain_id
+
+    client = _build_level2_client(private_key, api_key, api_secret, api_passphrase, host, chain_id)
+
+    cap_path, fh = _open_capture("cancel-order")
+    log.info("Cancelling order_id=%s, capturing to %s", order_id, cap_path)
+
+    for attempt in (1, 2):
+        log.info("Cancel attempt %d for order_id=%s", attempt, order_id)
+        t0 = time.perf_counter()
+        try:
+            result = client.cancel(order_id)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 200
+            resp_body = result if isinstance(result, dict) else {"result": str(result)}
+        except PolyException as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 400
+            resp_body = {"error": str(exc)}
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 0
+            resp_body = {"error": str(exc)}
+
+        capture = CapturedRequest(
+            url=f"{host}/order",
+            method="DELETE",
+            request_body={"orderID": order_id, "attempt": attempt},
+            response_status=status_code,
+            response_headers={},
+            response_body=_redact_payload(resp_body),
+            latency_ms=latency_ms,
+        )
+        _write_capture(fh, capture)
+
+        print(f"\n--- Cancel attempt {attempt} ---")
+        print(f"  status_code : {status_code}")
+        print(f"  latency_ms  : {latency_ms}")
+        print(f"  response    : {resp_body}")
+
+    fh.close()
+    print(f"\n[Captured to {cap_path}]")
+    print("(Two cancel attempts captured — compare responses to observe idempotency behaviour.)")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: replay-same-nonce
+# ---------------------------------------------------------------------------
+
+def cmd_replay_same_nonce(args: argparse.Namespace) -> None:
+    """Reconstruct an order with the same salt/nonce and submit twice.
+
+    Either retrieves original order parameters from the CLOB (if ``--salt``
+    is not given) or uses ``--salt`` directly.  The goal is to observe whether
+    Polymarket deduplicates on the salt/signature or accepts two submissions.
+
+    Args:
+        args: Parsed arguments.  Reads ``args.order_id``, ``args.salt``,
+              ``args.host``, ``args.chain_id``.
+    """
+    from py_clob_client.clob_types import OrderArgs  # noqa: PLC0415
+    from py_clob_client.exceptions import PolyException  # noqa: PLC0415
+    from py_order_utils.builders.order_builder import OrderBuilder as UtilsOrderBuilder  # noqa: PLC0415
+    from py_order_utils.model import OrderData, EOA  # noqa: PLC0415
+    from py_order_utils.signer import Signer as UtilsSigner  # noqa: PLC0415
+    from py_clob_client.config import get_contract_config  # noqa: PLC0415
+
+    private_key, api_key, api_secret, api_passphrase, address = _load_api_creds()
+    order_id: str = args.order_id
+    host: str = args.host
+    chain_id: int = args.chain_id
+
+    client = _build_level2_client(private_key, api_key, api_secret, api_passphrase, host, chain_id)
+
+    cap_path, fh = _open_capture("replay-same-nonce")
+    log.info("Replaying same-nonce for order_id=%s, capturing to %s", order_id, cap_path)
+
+    # Attempt to fetch the original order.
+    original: dict[str, Any] | None = None
+    if not args.salt:
+        try:
+            original = client.get_order(order_id)
+            log.info("Retrieved original order from CLOB")
+        except PolyException as exc:
+            log.warning("Could not retrieve order %s from CLOB: %s", order_id, exc)
+        except Exception as exc:
+            log.warning("Unexpected error fetching order: %s", exc)
+
+    salt: int
+    if args.salt:
+        salt = int(args.salt)
+    elif original and isinstance(original, dict):
+        # The CLOB returns the order JSON which includes the salt from the EIP-712 struct.
+        salt_raw = original.get("salt", original.get("order", {}).get("salt", None))
+        if salt_raw is None:
+            print(
+                "ERROR: Could not extract salt from original order. Use --salt <int>.",
+                file=sys.stderr,
+            )
+            fh.close()
+            sys.exit(1)
+        salt = int(salt_raw)
+    else:
+        print(
+            "ERROR: Cannot replay — could not fetch original order and --salt not provided.",
+            file=sys.stderr,
+        )
+        fh.close()
+        sys.exit(1)
+
+    # Extract parameters from original order if available.
+    token_id: str
+    price: float
+    size: float
+    side: str
+    if original and isinstance(original, dict):
+        # CLOB returns fields like tokenId/token_id, size, price, side.
+        token_id = str(original.get("asset_id") or original.get("tokenId", ""))
+        price = float(original.get("price", 0.05))
+        size = float(original.get("original_size") or original.get("size", 1.0))
+        side_raw = str(original.get("side", "BUY")).upper()
+        side = side_raw
+    else:
+        print(
+            "ERROR: No original order data available; cannot reconstruct parameters.",
+            file=sys.stderr,
+        )
+        fh.close()
+        sys.exit(1)
+
+    log.info("Replaying: token_id=%s side=%s price=%s size=%s salt=%d", token_id, side, price, size, salt)
+
+    # Determine tick size and neg_risk for the token.
+    try:
+        tick_size_str: str = client.get_tick_size(token_id)
+        neg_risk: bool = client.get_neg_risk(token_id)
+    except Exception as exc:
+        print(f"ERROR: Could not fetch market metadata: {exc}", file=sys.stderr)
+        fh.close()
+        sys.exit(1)
+
+    from py_clob_client.clob_types import CreateOrderOptions  # noqa: PLC0415
+    from py_clob_client.order_builder.builder import OrderBuilder, ROUNDING_CONFIG  # noqa: PLC0415
+    from py_clob_client.order_builder.constants import BUY, SELL  # noqa: PLC0415
+
+    # Build two identical orders with the same salt by overriding salt_generator.
+    def _fixed_salt_generator() -> int:
+        return salt
+
+    contract_config = get_contract_config(chain_id, neg_risk)
+    utils_builder = UtilsOrderBuilder(
+        exchange_address=contract_config.exchange,
+        chain_id=chain_id,
+        signer=UtilsSigner(key=private_key),
+        salt_generator=_fixed_salt_generator,
+    )
+
+    from py_order_utils.model import BUY as UtilsBuy, SELL as UtilsSell  # noqa: PLC0415
+    from py_clob_client.order_builder.helpers import to_token_decimals, round_normal, round_down  # noqa: PLC0415
+
+    round_cfg = ROUNDING_CONFIG[tick_size_str]
+    raw_price = round_normal(price, round_cfg.price)
+
+    if side == "BUY":
+        raw_taker = round_down(size, round_cfg.size)
+        raw_maker = raw_taker * raw_price
+        side_val = UtilsBuy
+        maker_amount = to_token_decimals(raw_maker)
+        taker_amount = to_token_decimals(raw_taker)
+    else:
+        raw_maker = round_down(size, round_cfg.size)
+        raw_taker = raw_maker * raw_price
+        side_val = UtilsSell
+        maker_amount = to_token_decimals(raw_maker)
+        taker_amount = to_token_decimals(raw_taker)
+
+    from py_order_utils.model import OrderData  # noqa: PLC0415
+    from py_order_utils.model.signatures import EOA  # noqa: PLC0415
+
+    order_data = OrderData(
+        maker=address,
+        taker="0x0000000000000000000000000000000000000000",
+        tokenId=token_id,
+        makerAmount=str(maker_amount),
+        takerAmount=str(taker_amount),
+        side=side_val,
+        feeRateBps="0",
+        nonce="0",
+        signer=address,
+        expiration="0",
+        signatureType=EOA,
+    )
+
+    from py_clob_client.utilities import order_to_json  # noqa: PLC0415
+    from py_clob_client.constants import OrderType  # noqa: PLC0415
+
+    for attempt in (1, 2):
+        log.info("Submitting same-nonce attempt %d", attempt)
+        signed = utils_builder.build_signed_order(order_data)
+        body_dict = order_to_json(signed, api_key, OrderType.GTC)
+
+        t0 = time.perf_counter()
+        try:
+            result = client.post_order(signed)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 200
+            resp_body = result if isinstance(result, dict) else {"result": str(result)}
+        except PolyException as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 400
+            resp_body = {"error": str(exc)}
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 0
+            resp_body = {"error": str(exc)}
+
+        capture = CapturedRequest(
+            url=f"{host}/order",
+            method="POST",
+            request_body=_redact_payload(body_dict),
+            response_status=status_code,
+            response_headers={},
+            response_body=_redact_payload(resp_body),
+            latency_ms=latency_ms,
+        )
+        _write_capture(fh, capture)
+
+        print(f"\n--- Replay attempt {attempt} (salt={salt}) ---")
+        print(f"  status_code : {status_code}")
+        print(f"  latency_ms  : {latency_ms}")
+        print(f"  response    : {resp_body}")
+
+    fh.close()
+    print(f"\n[Captured to {cap_path}]")
+    print("(Compare attempt 1 vs 2: does Polymarket reject the duplicate salt?)")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: bad-orders
+# ---------------------------------------------------------------------------
+
+def cmd_bad_orders(args: argparse.Namespace) -> None:
+    """Fire deliberately invalid signed orders and capture error shapes.
+
+    Probes:
+    1. Price not a multiple of minimum_tick_size.
+    2. Size below minimum_order_size.
+    3. Order signed by EOA with zero USDC allowance to exchange contract.
+    4. expiration in the past.
+    5. Wrong signature_type (EOA=0 used even for a Polymarket-proxy wallet).
+
+    Args:
+        args: Parsed arguments.  Reads ``args.token_id``, ``args.host``,
+              ``args.chain_id``.
+    """
+    from py_clob_client.clob_types import OrderArgs, CreateOrderOptions  # noqa: PLC0415
+    from py_clob_client.exceptions import PolyException  # noqa: PLC0415
+    from py_clob_client.constants import OrderType  # noqa: PLC0415
+    from py_clob_client.utilities import order_to_json  # noqa: PLC0415
+    from py_order_utils.model.signatures import EOA, POLY_PROXY  # noqa: PLC0415
+
+    private_key, api_key, api_secret, api_passphrase, address = _load_api_creds()
+    token_id: str = args.token_id
+    host: str = args.host
+    chain_id: int = args.chain_id
+
+    client = _build_level2_client(private_key, api_key, api_secret, api_passphrase, host, chain_id)
+
+    # Fetch market metadata for constructing orders.
+    try:
+        tick_size_str: str = client.get_tick_size(token_id)
+        neg_risk: bool = client.get_neg_risk(token_id)
+    except Exception as exc:
+        print(f"ERROR: Could not fetch market metadata for token_id={token_id}: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    tick_size = float(tick_size_str)
+
+    cap_path, fh = _open_capture("bad-orders")
+    log.info("Firing bad orders for token_id=%s, capturing to %s", token_id, cap_path)
+
+    summary_rows: list[dict[str, Any]] = []
+
+    def _submit_order_args(
+        label: str,
+        order_args: OrderArgs,
+        options: CreateOrderOptions | None = None,
+        sig_type_override: int | None = None,
+    ) -> None:
+        """Build and submit one bad order; capture and add to summary.
+
+        Args:
+            label: Human-readable probe label.
+            order_args: Order parameters.
+            options: Optional override for CreateOrderOptions.
+            sig_type_override: If set, override the signatureType in the built order.
+        """
+        from py_clob_client.order_builder.builder import OrderBuilder  # noqa: PLC0415
+        from py_order_utils.builders.order_builder import OrderBuilder as UtilsOrderBuilder  # noqa: PLC0415
+        from py_order_utils.signer import Signer as UtilsSigner  # noqa: PLC0415
+        from py_clob_client.config import get_contract_config  # noqa: PLC0415
+        from py_order_utils.model import OrderData, BUY as UtilsBuy, SELL as UtilsSell  # noqa: PLC0415
+        from py_clob_client.order_builder.helpers import to_token_decimals, round_normal, round_down  # noqa: PLC0415
+        from py_clob_client.order_builder.builder import ROUNDING_CONFIG  # noqa: PLC0415
+        from py_clob_client.order_builder.constants import BUY, SELL  # noqa: PLC0415
+        from py_order_utils.utils import generate_seed  # noqa: PLC0415
+
+        # Resolve tick size + neg_risk from options or defaults.
+        resolved_tick: str = options.tick_size if options else tick_size_str
+        resolved_neg_risk: bool = options.neg_risk if options else neg_risk
+
+        round_cfg = ROUNDING_CONFIG[resolved_tick]
+        raw_price = round_normal(order_args.price, round_cfg.price)
+
+        side_str = order_args.side.upper()
+        if side_str == BUY:
+            raw_taker = round_down(order_args.size, round_cfg.size)
+            raw_maker = raw_taker * raw_price
+            side_val = UtilsBuy
+        else:
+            raw_maker = round_down(order_args.size, round_cfg.size)
+            raw_taker = raw_maker * raw_price
+            side_val = UtilsSell
+
+        maker_amount = to_token_decimals(raw_maker)
+        taker_amount = to_token_decimals(raw_taker)
+
+        # Handle sig_type override for "wrong signature_type" probe.
+        sig_type = sig_type_override if sig_type_override is not None else EOA
+
+        contract_config = get_contract_config(chain_id, resolved_neg_risk)
+        order_data = OrderData(
+            maker=address,
+            taker="0x0000000000000000000000000000000000000000",
+            tokenId=order_args.token_id,
+            makerAmount=str(maker_amount),
+            takerAmount=str(taker_amount),
+            side=side_val,
+            feeRateBps=str(order_args.fee_rate_bps),
+            nonce=str(order_args.nonce),
+            signer=address,
+            expiration=str(order_args.expiration),
+            signatureType=sig_type,
+        )
+
+        utils_builder = UtilsOrderBuilder(
+            exchange_address=contract_config.exchange,
+            chain_id=chain_id,
+            signer=UtilsSigner(key=private_key),
+        )
+
+        try:
+            signed = utils_builder.build_signed_order(order_data)
+        except Exception as exc:
+            summary_rows.append({
+                "probe": label,
+                "build_error": str(exc),
+                "status": "BUILD_FAILED",
+                "snippet": str(exc)[:120],
+            })
+            return
+
+        body_dict = order_to_json(signed, api_key, OrderType.GTC)
+
+        t0 = time.perf_counter()
+        try:
+            result = client.post_order(signed)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 200
+            resp_body = result if isinstance(result, dict) else {"result": str(result)}
+        except PolyException as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 400
+            resp_body = {"error": str(exc)}
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            status_code = 0
+            resp_body = {"error": str(exc)}
+
+        capture = CapturedRequest(
+            url=f"{host}/order",
+            method="POST",
+            request_body=_redact_payload(body_dict),
+            response_status=status_code,
+            response_headers={},
+            response_body=_redact_payload(resp_body),
+            latency_ms=latency_ms,
+        )
+        _write_capture(fh, capture)
+
+        snippet = str(resp_body)[:120]
+        summary_rows.append({
+            "probe": label,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "snippet": snippet,
+        })
+
+    # 1. Price not a multiple of minimum_tick_size.
+    # Use a price that deliberately is not on-grid (offset by half a tick).
+    bad_price = round(0.05 + tick_size * 0.5, 8)
+    _submit_order_args(
+        "price_bad_tick",
+        OrderArgs(token_id=token_id, price=bad_price, size=2.0, side="BUY"),
+    )
+
+    # 2. Size below minimum_order_size (use 0.000001 — almost certainly below any minimum).
+    _submit_order_args(
+        "size_below_minimum",
+        OrderArgs(token_id=token_id, price=tick_size, size=0.000001, side="BUY"),
+    )
+
+    # 3. EOA with zero USDC allowance — we intentionally do NOT approve the exchange contract.
+    # For a fresh wallet this is the natural state; just place a valid-looking order.
+    _submit_order_args(
+        "zero_usdc_allowance",
+        OrderArgs(token_id=token_id, price=tick_size, size=1.0, side="BUY"),
+    )
+
+    # 4. expiration in the past (Unix epoch 1 = 1970-01-01 00:00:01 UTC).
+    _submit_order_args(
+        "expired_order",
+        OrderArgs(token_id=token_id, price=tick_size, size=1.0, side="BUY", expiration=1),
+    )
+
+    # 5. Wrong signature_type: POLY_PROXY=2 when wallet is a plain EOA.
+    _submit_order_args(
+        "wrong_signature_type",
+        OrderArgs(token_id=token_id, price=tick_size, size=1.0, side="BUY"),
+        sig_type_override=POLY_PROXY,
+    )
+
+    fh.close()
+
+    print("\n=== Bad-orders probe summary ===")
+    cols = ["probe", "status_code", "latency_ms", "snippet"]
+    for row in summary_rows:
+        print(f"\n  [{row['probe']}]")
+        for col in cols:
+            if col in row:
+                print(f"    {col:<14}: {row[col]}")
+        if "build_error" in row:
+            print(f"    build_error   : {row['build_error']}")
+    print(f"\n[Captured to {cap_path}]")
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing and dispatch
 # ---------------------------------------------------------------------------
 
@@ -664,6 +1703,89 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--requests", type=int, default=200)
     p.add_argument("--concurrency", type=int, default=20)
 
+    # ---- Auth/signing subcommands ----
+
+    # init-wallet
+    p = sub.add_parser(
+        "init-wallet",
+        help="Generate a fresh disposable EOA; write key to POLYMARKET_SCOUT_KEYFILE",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Overwrite existing keyfile (existing key will be lost)",
+    )
+
+    # wallet-info
+    p = sub.add_parser(
+        "wallet-info",
+        help="Print wallet address; optionally fetch MATIC + USDC balance via RPC",
+    )
+    p.add_argument("--rpc", default=None, metavar="URL",
+                   help="Polygon RPC URL (e.g. https://polygon-rpc.com)")
+    p.add_argument("--usdc", default=None, metavar="0x...",
+                   help=f"USDC contract address override (default: {_POLYGON_USDC_ADDRESS})")
+
+    # derive-api-keys
+    p = sub.add_parser(
+        "derive-api-keys",
+        help="Derive/create L2 API credentials from CLOB; store at <keyfile-stem>.apikeys.json",
+    )
+    p.add_argument("--host", default=CLOB_BASE, help=f"CLOB host (default: {CLOB_BASE})")
+    p.add_argument("--chain-id", type=int, default=137,
+                   help="Chain ID: 137=Polygon mainnet, 80002=Amoy testnet (default: 137)")
+
+    # place-resting-order
+    p = sub.add_parser(
+        "place-resting-order",
+        help="Place a limit order well off the touch (hard cap: 5 USDC notional)",
+    )
+    p.add_argument("--token-id", required=True, help="ERC-1155 token/asset id")
+    p.add_argument("--side", required=True, choices=["BUY", "SELL"],
+                   help="Order side")
+    p.add_argument("--price", required=True, type=float,
+                   help="Limit price (0 < price < 1)")
+    p.add_argument("--size", required=True, type=float,
+                   help="Size in outcome tokens; price*size must be <= 5 USDC")
+    p.add_argument("--allow-near-touch", action="store_true", default=False,
+                   help="Skip the safety price check (BUY<=0.20, SELL>=0.80 guard)")
+    p.add_argument("--host", default=CLOB_BASE, help=f"CLOB host (default: {CLOB_BASE})")
+    p.add_argument("--chain-id", type=int, default=137,
+                   help="Chain ID: 137=Polygon mainnet, 80002=Amoy testnet (default: 137)")
+
+    # cancel-order
+    p = sub.add_parser(
+        "cancel-order",
+        help="Cancel an order by ID; sends the cancel twice to observe idempotency",
+    )
+    p.add_argument("order_id", help="Order ID returned by place-resting-order")
+    p.add_argument("--host", default=CLOB_BASE, help=f"CLOB host (default: {CLOB_BASE})")
+    p.add_argument("--chain-id", type=int, default=137,
+                   help="Chain ID: 137=Polygon mainnet, 80002=Amoy testnet (default: 137)")
+
+    # replay-same-nonce
+    p = sub.add_parser(
+        "replay-same-nonce",
+        help="Submit the same signed order twice to test deduplication by salt",
+    )
+    p.add_argument("order_id", help="Original order ID (used to fetch params from CLOB)")
+    p.add_argument("--salt", type=int, default=None,
+                   help="Explicit salt override (required if CLOB no longer has the order)")
+    p.add_argument("--host", default=CLOB_BASE, help=f"CLOB host (default: {CLOB_BASE})")
+    p.add_argument("--chain-id", type=int, default=137,
+                   help="Chain ID: 137=Polygon mainnet, 80002=Amoy testnet (default: 137)")
+
+    # bad-orders
+    p = sub.add_parser(
+        "bad-orders",
+        help="Fire deliberately invalid signed orders; capture error shapes",
+    )
+    p.add_argument("--token-id", required=True, help="ERC-1155 token/asset id to use for probes")
+    p.add_argument("--host", default=CLOB_BASE, help=f"CLOB host (default: {CLOB_BASE})")
+    p.add_argument("--chain-id", type=int, default=137,
+                   help="Chain ID: 137=Polygon mainnet, 80002=Amoy testnet (default: 137)")
+
     return parser
 
 
@@ -676,14 +1798,31 @@ DISPATCH: dict[str, Any] = {
     "find-resolved": cmd_find_resolved,
     "probe-errors": cmd_probe_errors,
     "probe-rate-limit": cmd_probe_rate_limit,
+    # Auth/signing subcommands (sync — no asyncio wrapper needed).
+    "init-wallet": cmd_init_wallet,
+    "derive-api-keys": cmd_derive_api_keys,
+    "cancel-order": cmd_cancel_order,
+    "replay-same-nonce": cmd_replay_same_nonce,
+    "bad-orders": cmd_bad_orders,
+    # wallet-info and place-resting-order are async.
+    "wallet-info": cmd_wallet_info,
+    "place-resting-order": cmd_place_resting_order,
 }
+
+# Subcommands that are plain sync functions (not coroutines).
+_SYNC_COMMANDS: frozenset[str] = frozenset(
+    ["init-wallet", "derive-api-keys", "cancel-order", "replay-same-nonce", "bad-orders"]
+)
 
 
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     fn = DISPATCH[args.subcmd]
-    await fn(args)
+    if args.subcmd in _SYNC_COMMANDS:
+        fn(args)
+    else:
+        await fn(args)
 
 
 if __name__ == "__main__":
