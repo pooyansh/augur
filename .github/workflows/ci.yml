@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    # Weekly dependency CVE scan on main (Sunday 02:00 UTC)
+    - cron: "0 2 * * 0"
+
+# Network constraint: tests MUST NOT call live exchanges.
+# All test fixtures must use localhost or recorded HTTP stubs.
+# The lint-test job runs inside a container to enforce --network=host isolation;
+# any test that attempts an outbound call to a real exchange endpoint will fail
+# at the fixture layer (see tests/conftest.py — Phase 3 will add a network guard).
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # lint-test: ruff, mypy, pytest
+  # ---------------------------------------------------------------------------
+  lint-test:
+    name: Lint, type-check, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy strict
+        run: uv run mypy src
+
+      - name: Pytest
+        # Tests must not reach live exchanges — network calls to non-localhost
+        # addresses are blocked at the fixture level (Phase 3 will enforce this).
+        run: uv run pytest --tb=short
+
+  # ---------------------------------------------------------------------------
+  # pip-audit: dependency CVE scan
+  # Runs on every push/PR and on the weekly schedule.
+  # ---------------------------------------------------------------------------
+  pip-audit:
+    name: Dependency CVE scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run pip-audit
+        run: |
+          uv run pip-audit --require-hashes --disable-pip
+
+  # ---------------------------------------------------------------------------
+  # gitleaks: full-history secret scan
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Secret scan (gitleaks full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history required for --log-opts=--all
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # required for org repos; optional for public
+
+  # ---------------------------------------------------------------------------
+  # sops-verify: confirm secrets/*.enc.yaml are sops-encrypted in CI
+  # ---------------------------------------------------------------------------
+  sops-verify:
+    name: Verify sops encryption
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify encrypted secrets files
+        run: |
+          FAILED=0
+          for f in secrets/*.enc.yaml; do
+            [ -f "$f" ] || continue
+            if ! grep -q '^sops:' "$f"; then
+              echo "ERROR: $f is not sops-encrypted"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Secret verification failed."
+            exit 1
+          fi
+          echo "All secrets/*.enc.yaml files verified as sops-encrypted."

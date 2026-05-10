@@ -1,0 +1,45 @@
+name: Image Security Scan
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "pyproject.toml"
+      - "uv.lock"
+  schedule:
+    # Weekly Trivy scan of images built from main (Sunday 03:00 UTC)
+    - cron: "0 3 * * 0"
+
+jobs:
+  trivy-scan:
+    name: Build and scan images (Trivy)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          - name: manager
+            dockerfile: docker/Dockerfile.manager
+          - name: bot
+            dockerfile: docker/Dockerfile.bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (for uv.lock copy into build context)
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build image — ${{ matrix.image.name }}
+        run: |
+          docker build \
+            -f ${{ matrix.image.dockerfile }} \
+            -t polymarket-bidder-bot/${{ matrix.image.name }}:ci-${{ github.sha }} \
+            .
+
+      - name: Run Trivy vulnerability scan — ${{ matrix.image.name }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: polymarket-bidder-bot/${{ matrix.image.name }}:ci-${{ github.sha }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"

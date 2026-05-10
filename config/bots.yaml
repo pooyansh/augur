@@ -1,0 +1,23 @@
+# config/bots.yaml — bot roster.
+#
+# This file is NOT a secret and IS committed to the repo.
+# Secret references (API keys, wallet keys) use symbolic names that the
+# entrypoint resolves from the decrypted secrets mount at /run/secrets/.
+#
+# Example bot entry (Phase 7 will populate real strategies):
+#
+# bots:
+#   - id: btc-momentum-001
+#     strategy: momentum_v1
+#     market: "0x1234..."       # Polymarket market CLOB address
+#     mode: paper               # paper | live (live requires three locks)
+#     live: false               # must be true for live trading
+#     exchange: polymarket
+#     secrets_ref: exchanges    # decrypted from /run/secrets/exchanges.yaml
+#     config:
+#       signal_window_bars: 4
+#       max_position_usdc: 100.0
+#       max_daily_loss_usdc: 20.0
+#       max_orders_per_minute: 5
+
+bots: []

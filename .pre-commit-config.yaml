@@ -1,0 +1,59 @@
+repos:
+  # ---------------------------------------------------------------------------
+  # Standard file hygiene
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-yaml
+        exclude: ^secrets/  # encrypted YAML may not parse cleanly
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # ---------------------------------------------------------------------------
+  # Ruff — lint + format
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  # ---------------------------------------------------------------------------
+  # Mypy — static type checking
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - "sqlalchemy[asyncio]>=2.0"
+          - "pydantic>=2.7"
+          - "structlog>=24"
+        args: ["--strict", "--explicit-package-bases"]
+        pass_filenames: false
+        # Run against src only; tests are excluded from strict mypy in pre-commit.
+        # CI runs the full check via `uv run mypy src`.
+
+  # ---------------------------------------------------------------------------
+  # sops verification — blocks plaintext secrets from being committed
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: sops-verify
+        name: Verify secrets are sops-encrypted
+        language: script
+        entry: scripts/verify-sops.sh
+        files: ^secrets/.*\.enc\.yaml$
+        pass_filenames: true
+
+  # ---------------------------------------------------------------------------
+  # gitleaks — secret scanner
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks

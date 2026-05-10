@@ -1,0 +1,66 @@
+# docker-compose.yml — production-shape stack.
+#
+# TODO(phase-9): Pin all images by digest before deploying to the VPS.
+#   Example: postgres:16-alpine@sha256:<digest>
+#   Run `docker buildx imagetools inspect postgres:16-alpine` to get the digest.
+
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.manager
+    image: polymarket-bidder-bot/manager:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    user: "10001:10001"
+    tmpfs:
+      # Decrypted secrets land here — never on the real filesystem.
+      - /run/secrets:size=4m,mode=0700
+      # Scratch space for the app process.
+      - /tmp:size=16m
+    volumes:
+      # Age private key — mounted read-only from the host; never copied into
+      # the image. The host path is the dev default; override in prod via an
+      # environment-specific compose override or a Docker secret.
+      - type: bind
+        source: ${SOPS_AGE_KEY_FILE:-~/.config/sops/age/keys.txt}
+        target: /run/age/keys.txt
+        read_only: true
+      # Encrypted secrets directory — read-only; entrypoint decrypts to tmpfs.
+      - type: bind
+        source: ./secrets
+        target: /app/secrets
+        read_only: true
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Postgres 16
+  # TODO(phase-9): Pin postgres image by digest before deploying to the VPS.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bidder}
+      POSTGRES_USER: ${POSTGRES_USER:-bidder}
+      # Password comes from .env (non-secret placeholder) in dev.
+      # In prod it MUST be injected from the decrypted secrets — see entrypoint.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_prod}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bidder} -d ${POSTGRES_DB:-bidder}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata: {}

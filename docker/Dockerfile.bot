@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Stage 1: dependency builder
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+# Install uv via the official binary installer
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Copy only the files needed to resolve and install dependencies
+COPY pyproject.toml uv.lock ./
+
+# Install runtime deps only (no dev extras) into an explicit venv
+RUN uv venv /app/.venv \
+ && VIRTUAL_ENV=/app/.venv uv sync --frozen --no-dev
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime image
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+# Pin sops and age versions — update here when security patches land.
+# TODO(phase-9): switch to digest-pinned images for the base layer.
+ARG SOPS_VERSION=3.9.4
+ARG AGE_VERSION=1.2.1
+
+# Install sops and age
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && curl -fsSL \
+    "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
+    -o /usr/local/bin/sops \
+ && chmod +x /usr/local/bin/sops \
+ && curl -fsSL \
+    "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz" \
+    | tar -xz --strip-components=1 -C /usr/local/bin age/age age/age-keygen \
+ && apt-get remove -y curl \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user (UID 10001) and working directory
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin app \
+ && mkdir -p /app \
+ && chown 10001:10001 /app
+
+WORKDIR /app
+
+# Copy venv from builder stage
+COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
+
+# Copy application source
+COPY --chown=10001:10001 src/ ./src/
+
+# Copy entrypoint
+COPY --chown=10001:10001 docker/entrypoint.sh /app/docker/entrypoint.sh
+
+# Add uv binary for `uv run` at runtime
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+USER 10001:10001
+
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+CMD ["python", "-m", "bots.runner"]

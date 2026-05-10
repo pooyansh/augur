@@ -1,0 +1,42 @@
+# docker-compose.dev.yml — development overrides.
+#
+# Applies ON TOP of docker-compose.yml; never substitutes the image:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Adds:
+#   - pgadmin for database inspection
+#   - Live src/ bind-mount so edits take effect without rebuilding
+#   - secrets/ bind-mount (read-only) so the entrypoint can decrypt in dev
+
+services:
+  manager:
+    # Bind-mount src/ for live reloading during development.
+    # The container image still contains a full copy of src/; this mount
+    # shadows it so local edits are visible immediately.
+    volumes:
+      - type: bind
+        source: ./src
+        target: /app/src
+      # secrets bind-mount is already in the base compose; kept here for
+      # clarity but the base file is authoritative.
+
+  # ---------------------------------------------------------------------------
+  # pgadmin — dev-only database GUI.
+  # TODO(phase-9): Remove or gate behind a profile before VPS deploy.
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@localhost
+      PGADMIN_DEFAULT_PASSWORD: pgadmin_dev_only
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pgadmin_data: {}
