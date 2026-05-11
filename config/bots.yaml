@@ -4,20 +4,25 @@
 # Secret references (API keys, wallet keys) use symbolic names that the
 # entrypoint resolves from the decrypted secrets mount at /run/secrets/.
 #
-# Example bot entry (Phase 7 will populate real strategies):
+# Schema enforced by src/manager/config.py (Pydantic BotsRoster).
+# Manager startup validates the full file before spawning any bot.
+# A single invalid entry fails the whole load — no partial roster.
 #
-# bots:
-#   - id: btc-momentum-001
-#     strategy: momentum_v1
-#     market: "0x1234..."       # Polymarket market CLOB address
-#     mode: paper               # paper | live (live requires three locks)
-#     live: false               # must be true for live trading
-#     exchange: polymarket
-#     secrets_ref: exchanges    # decrypted from /run/secrets/exchanges.yaml
-#     config:
-#       signal_window_bars: 4
-#       max_position_usdc: 100.0
-#       max_daily_loss_usdc: 20.0
-#       max_orders_per_minute: 5
+# Schedule format: "every:Ns" where N is a positive integer of seconds.
+# Cron syntax is not yet supported (NotImplementedError with a clear message).
 
-bots: []
+bots:
+  - id: echo-paper-1
+    strategy: null_strategy
+    market:
+      exchange: echo
+      market_id: ECHO-TEST
+    mode: paper
+    schedule: "every:60s"
+    signals: []
+    risk:
+      max_position_notional: "100"
+      max_daily_loss: "10"
+      max_orders_per_minute: 5
+    secrets:
+      exchange_credentials: "echo.dev"
