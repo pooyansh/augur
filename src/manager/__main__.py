@@ -71,7 +71,33 @@ def cli() -> None:
     show_default=True,
     help="Directory containing decrypted secret YAML files.",
 )
-def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
+@click.option(
+    "--dashboard-port",
+    default=8090,
+    show_default=True,
+    type=int,
+    help="TCP port for the operator dashboard HTTP server.",
+)
+@click.option(
+    "--dashboard-host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Bind address for the operator dashboard (must be 127.0.0.1 in v1).",
+)
+@click.option(
+    "--no-dashboard",
+    is_flag=True,
+    default=False,
+    help="Disable the operator dashboard HTTP server.",
+)
+def start(
+    bots_file: str,
+    sock_dir: str,
+    secrets_dir: str,
+    dashboard_port: int,
+    dashboard_host: str,
+    no_dashboard: bool,
+) -> None:
     """Load the bot roster and run the supervisor until SIGTERM.
 
     Validates config/bots.yaml fully before spawning any bot.  An invalid
@@ -80,6 +106,17 @@ def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
     Writes the manager PID to ``<sock-dir>/manager.pid`` so that ``reload``
     and ``drain`` can find the process.
     """
+    # Validate dashboard-host before doing anything else.
+    if dashboard_host != "127.0.0.1":
+        click.echo(
+            f"ERROR: --dashboard-host '{dashboard_host}' is not '127.0.0.1'. "
+            "Public exposure of the dashboard is not supported in v1. "
+            "# TODO(phase-9): add bearer-token / OIDC auth before allowing "
+            "non-loopback bind addresses.",
+            err=True,
+        )
+        sys.exit(1)
+
     from src.bots.base import Clock
     from src.manager.supervisor import Supervisor, SupervisorDeps, _default_spawn
     from src.secrets.install import configure_logging_with_redaction
@@ -179,6 +216,50 @@ def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
         else:
             logger.warning("POSTGRES_HOST not set — signals runtime disabled.")
 
+        # ------------------------------------------------------------------
+        # Dashboard server + perf_rollup refresher
+        # ------------------------------------------------------------------
+        from src.manager.dashboard import DashboardDb, DashboardServer, PerfRollupRefresher
+        from src.manager.dashboard.redact import JsonRedactor
+
+        dashboard_server: DashboardServer | None = None
+        rollup_refresher: PerfRollupRefresher | None = None
+        dashboard_db: DashboardDb | None = None
+
+        if not no_dashboard:
+            # Flatten all string leaf values from the secrets dict for redaction.
+            def _extract_secret_strings(obj: object) -> list[str]:
+                if isinstance(obj, str):
+                    return [obj]
+                if isinstance(obj, dict):
+                    result_strs: list[str] = []
+                    for v in obj.values():
+                        result_strs.extend(_extract_secret_strings(v))
+                    return result_strs
+                return []
+
+            secret_strings = _extract_secret_strings(loaded_secrets)
+            redactor = JsonRedactor(secret_strings)
+            dashboard_db = DashboardDb()
+            try:
+                await dashboard_db.open()
+            except Exception as exc:
+                logger.warning(
+                    "DashboardDb failed to open (Postgres unavailable?): %s — "
+                    "dashboard endpoints will error at query time.",
+                    exc,
+                )
+
+            dashboard_server = DashboardServer(
+                db=dashboard_db,
+                redactor=redactor,
+                supervisor=supervisor,
+            )
+            await dashboard_server.start(host=dashboard_host, port=dashboard_port)
+
+            rollup_refresher = PerfRollupRefresher()
+            await rollup_refresher.start()
+
         # Write PID file.
         pid_file = sock_path / "manager.pid"
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -206,6 +287,14 @@ def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
         # Wait for stop signal.
         await stop_event.wait()
         await supervisor.stop()
+
+        # Shut down dashboard components.
+        if rollup_refresher is not None:
+            await rollup_refresher.stop()
+        if dashboard_server is not None:
+            await dashboard_server.stop()
+        if dashboard_db is not None:
+            await dashboard_db.close()
 
         # Shut down signals runtime.
         if signals_runtime is not None:

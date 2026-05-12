@@ -1,5 +1,20 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
+# Stage 0: web-build — compile the operator dashboard SPA
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS web-build
+
+WORKDIR /app/web
+
+# Install Node dependencies first (layer cached until package-lock changes).
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --silent
+
+# Copy the rest of the web source and build.
+COPY web/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
 # Stage 1: dependency builder
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS builder
@@ -54,6 +69,10 @@ COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 
 # Copy application source
 COPY --chown=10001:10001 src/ ./src/
+
+# Copy the compiled SPA bundle from the web-build stage.
+# No npm in the runtime image — the bundle is already built.
+COPY --from=web-build --chown=10001:10001 /app/web/dist /app/web/dist
 
 # Copy entrypoint
 COPY --chown=10001:10001 docker/entrypoint.sh /app/docker/entrypoint.sh

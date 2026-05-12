@@ -82,6 +82,72 @@ make secrets-rotate FILE=infra # update recipients (e.g. after adding CI key)
 | `.github/workflows/image-scan.yml` | Configured |
 | Business logic (strategies, adapters, signals, risk) | Phase 3+ |
 
+## Dashboard
+
+The manager exposes a read-only operator dashboard at `http://127.0.0.1:8090/` by default.
+
+### Accessing the dashboard
+
+**Locally (dev):**
+
+```bash
+# The manager binds to 127.0.0.1 only. Open your browser directly:
+open http://127.0.0.1:8090/
+```
+
+**On a VPS — SSH tunnel:**
+
+```bash
+# From your laptop, tunnel port 8090 from the VPS to localhost:
+ssh -L 8090:localhost:8090 user@your-vps
+# Then open http://127.0.0.1:8090/ in your browser.
+```
+
+**On a VPS — Tailscale:**
+
+```bash
+# If the VPS is on your Tailscale network, tunnel via ts:
+ssh -L 8090:localhost:8090 user@<tailscale-ip>
+# Or run tailscale up on the VPS and access via Tailscale IP directly
+# once Phase 9 adds the auth story.
+```
+
+### CLI flags
+
+```bash
+uv run python -m src.manager start \
+    --dashboard-port 8090 \      # default
+    --dashboard-host 127.0.0.1 \ # must be 127.0.0.1 in v1
+    --no-dashboard               # disable the dashboard entirely
+```
+
+### Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/health` | Manager + Postgres health |
+| `GET /api/status` | Per-bot live heartbeat status |
+| `GET /api/bots` | Latest snapshot per bot |
+| `GET /api/bots/{id}` | Bot detail + last 50 audit rows |
+| `GET /api/strategies` | Per-strategy PnL rollup |
+| `GET /api/strategies/{name}` | Per-bot breakdown for one strategy |
+| `GET /api/markets` | Per-market exposure |
+| `GET /api/audit` | Paginated audit log (filters: bot_id, kind, since, before) |
+| `GET /api/failures` | Last-7-day failure timeline |
+| `GET /api/capital` | Total + per-exchange balance |
+
+All responses include `ETag` and `Cache-Control` headers; `If-None-Match` returns 304.
+
+### Security
+
+- v1 binds to `127.0.0.1` only. Passing `--dashboard-host` with a non-loopback value
+  is rejected with an error.
+- The `dashboard_reader` Postgres role has `SELECT`-only access. The dashboard cannot
+  write to the database even if attacked.
+- All free-form text (`last_error`, payloads) is passed through the Phase 3 redaction
+  filter before leaving the API.
+- Public exposure + auth is a Phase 9 task.
+
 ## Architecture
 
 See `CLAUDE.md` for the full architecture description, invariants, and subagent/slash-command

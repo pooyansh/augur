@@ -19,6 +19,8 @@ dependencies = [
     "structlog>=24",
     "tenacity>=8",
     "click>=8",
+    "fastapi>=0.136.1",
+    "uvicorn[standard]>=0.46.0",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +45,7 @@ line-length = 100
 target-version = "py312"
 src = ["src"]
 # Exclude Phase 1 scout code — it uses older patterns and is out of scope for Phase 2.
-exclude = ["scout/", "learnings/", "plan/"]
+exclude = ["scout/", "learnings/", "plan/", "web/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
