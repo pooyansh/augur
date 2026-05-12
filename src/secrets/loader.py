@@ -12,7 +12,7 @@ without needing a real mount.
 
 from __future__ import annotations
 
-__all__ = ["DEFAULT_SECRETS_DIR", "load_secrets"]
+__all__ = ["DEFAULT_SECRETS_DIR", "Secrets", "load_secrets"]
 
 import logging
 from pathlib import Path
@@ -68,3 +68,79 @@ def load_secrets(
         logger.debug("Loaded secrets file: %s (%d top-level keys)", yaml_path.name, len(data))
 
     return result
+
+
+class Secrets:
+    """Structured wrapper around the loaded secrets mapping.
+
+    Loaded once at startup via :meth:`load`; individual bot subprocesses
+    call :meth:`slice_for` to extract only the credentials slice they need.
+
+    Usage::
+
+        secrets = Secrets.load()
+        slice_ = secrets.slice_for("exchanges.polymarket.disposable")
+
+    Args:
+        data: Mapping returned by :func:`load_secrets`.
+            Keyed by filename stem (e.g. ``"exchanges"``, ``"alerts"``).
+    """
+
+    def __init__(self, data: dict[str, dict[str, Any]]) -> None:
+        self._data = data
+
+    @classmethod
+    def load(cls, base_dir: Path = DEFAULT_SECRETS_DIR) -> Secrets:
+        """Load all secrets from ``base_dir`` and wrap in a :class:`Secrets` instance.
+
+        Args:
+            base_dir: Directory containing the decrypted secret YAML files.
+
+        Returns:
+            :class:`Secrets` instance backed by all loaded files.
+        """
+        return cls(load_secrets(base_dir))
+
+    def slice_for(self, ref: str | Any) -> Any:
+        """Resolve a dotted-path reference into the secrets tree.
+
+        ``ref`` is either a plain dotted string (e.g.
+        ``"exchanges.polymarket.disposable"``) or a
+        :class:`~src.manager.config.SecretRef` model (which exposes
+        ``.exchange_credentials``).
+
+        The first segment selects the file stem; subsequent segments traverse
+        nested dicts.
+
+        Args:
+            ref: Dotted path string or a :class:`~src.manager.config.SecretRef`.
+
+        Returns:
+            The resolved leaf value (dict or scalar).
+
+        Raises:
+            KeyError: If any segment of the path is missing.
+        """
+        # Accept SecretRef objects as well as plain strings.
+        # Duck-typed: accepts SecretRef (has .exchange_credentials attribute).
+        path_str: str = ref if isinstance(ref, str) else str(ref.exchange_credentials)
+
+        parts = path_str.split(".")
+        node: Any = self._data
+        for part in parts:
+            if not isinstance(node, dict):
+                raise KeyError(
+                    f"Cannot traverse into non-dict at segment {part!r} in path {path_str!r}"
+                )
+            if part not in node:
+                raise KeyError(f"Segment {part!r} not found in secrets (path={path_str!r})")
+            node = node[part]
+        return node
+
+    def raw(self) -> dict[str, dict[str, Any]]:
+        """Return the full underlying secrets mapping (all stems).
+
+        Returns:
+            Mapping of ``{stem: {key: value, ...}, ...}``.
+        """
+        return self._data

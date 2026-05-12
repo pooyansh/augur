@@ -44,8 +44,11 @@ from src.exchanges.base import (
     OrderResult,
     OrderTemplate,
 )
+from src.risk.audit import AuditLogger
+from src.risk.caps import RiskCapExceeded, RiskCaps, check_caps
+from src.risk.kill_switch import KillSwitchCascade, KillSwitchReader
 from src.signals.base import SignalSnapshot
-from src.state.repository import AuditLogger, KillSwitchReader, StateRepository
+from src.state.repository import StateRepository
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +57,9 @@ logger = logging.getLogger(__name__)
 # Exceptions
 # ---------------------------------------------------------------------------
 
-
-class RiskCapExceeded(RuntimeError):  # noqa: N818 — name prescribed by CLAUDE.md Phase 3 spec
-    """Raised by ``_check_risk_caps`` when an intent violates a configured cap.
-
-    Caught by ``place()`` which records a ``RejectionEvent`` with
-    ``category="risk"`` in the audit log and does NOT forward to the adapter.
-    """
+# RiskCapExceeded is imported from src.risk.caps; re-exported here for
+# backward compatibility with existing tests that import from src.bots.base.
+# RiskCaps is also imported from src.risk.caps and re-exported below.
 
 
 class KillSwitchTripped(RuntimeError):  # noqa: N818 — name prescribed by CLAUDE.md Phase 3 spec
@@ -172,22 +171,6 @@ class Schedule:
 
 
 @dataclass
-class RiskCaps:
-    """Per-bot risk limits enforced in :meth:`BaseBot._check_risk_caps`.
-
-    Args:
-        max_position_notional: Maximum open position in collateral units.
-        max_daily_loss: Maximum cumulative loss allowed today (Decimal, positive).
-        max_orders_per_minute: Burst protection — orders placed in any rolling
-            60-second window.
-    """
-
-    max_position_notional: Decimal
-    max_daily_loss: Decimal
-    max_orders_per_minute: int
-
-
-@dataclass
 class BotConfig:
     """Static configuration for a single bot instance.
 
@@ -237,6 +220,9 @@ class BotDeps:
         rng: Injectable RNG for deterministic tests.
         signals: Signal snapshot provider.  Defaults to
             :class:`~src.signals.base.InMemorySignals` stub.
+        secrets_slice: Per-bot slice of the loaded secrets, resolved from
+            ``entry.secrets.exchange_credentials`` at subprocess start.
+            ``None`` in unit tests that do not load secrets.
     """
 
     adapter: ExchangeAdapter
@@ -247,6 +233,7 @@ class BotDeps:
     clock: Clock = field(default_factory=Clock)
     rng: Random = field(default_factory=random_module.Random)
     signals: Any = None  # InMemorySignals; typed as Any to avoid circular import
+    secrets_slice: Any = None  # Mapping[str, Any] | None — per-bot secret slice
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +310,12 @@ class BaseBot(ABC):
 
         # Warn callback — defaults to logger.warning; Phase 6 wires Slack/Discord.
         self._on_warn: Callable[[str], None] = lambda msg: logger.warning(msg)
+
+        # Kill-switch cascade: issues cancel_all exactly once per trip period.
+        self._ks_cascade = KillSwitchCascade(
+            audit=deps.audit,
+            bot_id=config.bot_id,
+        )
 
         if deps.signals is None:
             from src.signals.base import InMemorySignals
@@ -416,12 +409,15 @@ class BaseBot(ABC):
                 # 3. Kill switch
                 if await self._deps.kill_switch.is_tripped():
                     logger.warning(
-                        "Kill switch tripped — cancelling all orders for bot %s",
+                        "Kill switch tripped — skipping on_tick for bot %s",
                         self._config.bot_id,
                     )
-                    await self._deps.adapter.cancel_all(self._config.market_id)
+                    await self._ks_cascade.on_trip(self._deps.adapter, self._config.market_id)
                     await self._sleep_until_next_tick(tick_start)
                     continue
+                else:
+                    # Switch is clear — reset cascade so next trip re-issues cancel_all.
+                    self._ks_cascade.reset()
 
                 # 4. Strategy tick
                 decision = await self.on_tick(signals)
@@ -573,10 +569,9 @@ class BaseBot(ABC):
     async def _check_risk_caps(self, intent: OrderIntent) -> None:
         """Validate an intent against configured risk caps.
 
-        Checks (in order):
-        1. Position notional cap.
-        2. Daily loss cap.
-        3. Orders-per-minute rate cap.
+        Delegates to :func:`~src.risk.caps.check_caps`.  Prunes stale entries
+        from ``_recent_order_times`` before delegating so the rolling window is
+        always current.
 
         Args:
             intent: The order intent to validate.
@@ -585,33 +580,21 @@ class BaseBot(ABC):
             RiskCapExceeded: If any cap is breached.  The intent must NOT be
                 forwarded to the adapter.
         """
-        caps = self._config.risk
-        notional = intent.price * intent.size
-
-        # Position cap
-        if self._position_notional + notional > caps.max_position_notional:
-            raise RiskCapExceeded(
-                f"Position notional cap {caps.max_position_notional} would be exceeded "
-                f"(current={self._position_notional}, adding={notional})"
-            )
-
-        # Daily loss cap
-        if self._daily_loss >= caps.max_daily_loss:
-            raise RiskCapExceeded(
-                f"Daily loss cap {caps.max_daily_loss} reached (current={self._daily_loss})"
-            )
-
-        # Order rate cap — rolling 60-second window
         now = self._deps.clock.now()
+        # Prune stale entries from the rolling window before checking.
         window_start = now.timestamp() - 60.0
         self._recent_order_times = [
             t for t in self._recent_order_times if t.timestamp() >= window_start
         ]
-        if len(self._recent_order_times) >= caps.max_orders_per_minute:
-            raise RiskCapExceeded(
-                f"Order rate cap {caps.max_orders_per_minute}/min exceeded "
-                f"(recent={len(self._recent_order_times)})"
-            )
+        check_caps(
+            intent.price,
+            intent.size,
+            position_notional=self._position_notional,
+            daily_loss=self._daily_loss,
+            recent_order_times=self._recent_order_times,
+            caps=self._config.risk,
+            now=now,
+        )
 
     async def _persist_snapshot(self) -> None:
         """Write a snapshot to the state repository.

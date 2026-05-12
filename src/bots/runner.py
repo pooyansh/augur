@@ -71,7 +71,7 @@ async def _run(bot_id: str) -> None:
     from src.manager.heartbeat import HeartbeatClient, SocketHeartbeat
     from src.manager.registry import registry
     from src.secrets.install import configure_logging_with_redaction
-    from src.secrets.loader import load_secrets
+    from src.secrets.loader import Secrets, load_secrets
 
     # ------------------------------------------------------------------
     # 1. Logging + redaction
@@ -79,6 +79,7 @@ async def _run(bot_id: str) -> None:
     secrets_dir = Path(os.environ.get("SECRETS_DIR", "/run/secrets"))
     loaded_secrets = load_secrets(secrets_dir)
     configure_logging_with_redaction(loaded_secrets)
+    secrets = Secrets(loaded_secrets)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -178,6 +179,19 @@ async def _run(bot_id: str) -> None:
 
     market = await adapter.get_market(entry.market.market_id)
 
+    # ------------------------------------------------------------------
+    # Resolve per-bot secret slice
+    # ------------------------------------------------------------------
+    secrets_slice = None
+    try:
+        secrets_slice = secrets.slice_for(entry.secrets.exchange_credentials)
+    except KeyError:
+        logger.warning(
+            "Secret slice %r not found for bot %s — secrets_slice will be None.",
+            entry.secrets.exchange_credentials,
+            bot_id,
+        )
+
     deps = BotDeps(
         adapter=adapter,
         state=state,
@@ -185,6 +199,7 @@ async def _run(bot_id: str) -> None:
         heartbeat=heartbeat,
         audit=audit,
         clock=clock,
+        secrets_slice=secrets_slice,
     )
 
     # ------------------------------------------------------------------
