@@ -16,12 +16,13 @@ The plan is deliberately staged so that the first phase produces **knowledge**, 
 | 4 | [04-polymarket-adapter.md](04-polymarket-adapter.md) | Production Polymarket adapter w/ market lifecycle, position reconciliation, pessimistic paper-mode slippage | not started |
 | 5 | [05-manager-supervisor.md](05-manager-supervisor.md) | Manager: spawn, heartbeat, rehydrate, reload, `bots.yaml` schema, live allow-list, drain/status hooks | not started |
 | 6 | [06-risk-and-alerting.md](06-risk-and-alerting.md) | Risk caps in `BaseBot.place`, kill switch, audit log, severity-routed alerts, withdrawal allow-list | not started |
-| 6a | [06a-observability.md](06a-observability.md) | Metrics, structured logs with `tick_id`, `/healthz`, SLOs, Grafana dashboards — must land before Phase 7 | not started |
+| 6a | [06a-observability.md](06a-observability.md) | Metrics, structured logs with `tick_id`, `/healthz`, SLOs, Grafana dashboards (now optional — see 6b) — must land before Phase 7 | not started |
+| 6b | [06b-dashboard.md](06b-dashboard.md) | Operator dashboard: thin JSON API on the manager + client-rendered SPA (compute on the device, not the VPS) — per-bot/market/strategy perf, status, failure timeline | not started |
 | 7 | [07-first-strategy.md](07-first-strategy.md) | First real strategy (momentum_v1) end-to-end through paper | not started |
 | 8 | [08-kalshi-adapter.md](08-kalshi-adapter.md) | Second adapter — proves the abstraction | not started |
 | 9 | [09-promotion-and-ops.md](09-promotion-and-ops.md) | Paper→live checklist, VPS hardening, deploy/rollback, runbooks, postmortem template, DB ops | not started |
 
-Phases `3a` and `6a` are inserted (rather than renumbered) so links into the plan stay stable. Read order matches the table.
+Phases `3a`, `6a`, and `6b` are inserted (rather than renumbered) so links into the plan stay stable. Read order matches the table.
 
 ## Sidetracks
 

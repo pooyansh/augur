@@ -4,6 +4,11 @@
 
 Land before Phase 7's paper run, not after — the paper run is the first time you'll wish you had it.
 
+> **See also:** [`06b-dashboard.md`](06b-dashboard.md) — the human-facing operator
+> dashboard, split out because it has a hard "compute-on-client" requirement that
+> Grafana cannot satisfy. After 6b lands, the Prometheus + Grafana stack below
+> is **optional** (machine-grade ops view); revisit once 6b is in use.
+
 ## Deliverables — metrics
 
 - Prometheus client embedded in the manager and every bot. Manager scrapes a per-bot endpoint over the unix socket; exports a single aggregated `/metrics` endpoint.
