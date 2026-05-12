@@ -101,6 +101,49 @@ class AuditLog(Base):
     __table_args__ = (Index("ix_audit_log_bot_id_ts", "bot_id", "ts"),)
 
 
+class SignalSample(Base):
+    """Append-only record of every signal observation fetched by the runner.
+
+    INVARIANT: no DELETE or UPDATE ever touches this table.
+    Used by the backtest replay harness to stream historical samples through
+    strategies without touching live sources.
+
+    Columns:
+        id: BIGSERIAL primary key.
+        signal: Signal name (e.g. ``"btc_15min"``).
+        params_hash: blake2s(8) hex of the sorted params dict — deduplication
+            key shared by all bots subscribing to the same (name, params).
+        source: ``SignalSource.name`` of the source that produced this row.
+        observed_at: UTC timestamp when the sample was fetched from the source.
+        payload: Parsed canonical value as JSONB (output of ``Signal.parse``).
+        latency_ms: Round-trip fetch latency in milliseconds.
+
+    Indexes:
+        - ``(signal, params_hash, observed_at DESC)`` — efficient range scan for
+          replay queries and staleness checks.
+    """
+
+    __tablename__ = "signal_samples"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    signal = Column(Text, nullable=False)
+    params_hash = Column(Text, nullable=False)
+    source = Column(Text, nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    payload = Column(JSONB, nullable=False)
+    latency_ms = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        # Primary replay / staleness scan index.
+        Index(
+            "ix_signal_samples_signal_params_observed",
+            "signal",
+            "params_hash",
+            "observed_at",
+        ),
+    )
+
+
 class KillSwitch(Base):
     """Global kill-switch state.  Exactly one row expected (id = 1).
 

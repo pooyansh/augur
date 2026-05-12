@@ -145,6 +145,40 @@ def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
     )
 
     async def _run() -> None:
+        import httpx
+
+        from src.signals.registry import signals as signal_registry
+        from src.signals.runner import SignalsRuntime
+        from src.signals.storage import SignalStorage
+
+        # Auto-discover all registered signals.
+        signal_registry.autodiscover()
+
+        # Build the signals runtime (no-op storage stub if no Postgres).
+        signals_runtime: SignalsRuntime | None = None
+        http_client: httpx.AsyncClient | None = None
+
+        if session_factory is not None:
+            from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+            sf: async_sessionmaker[AsyncSession] = session_factory  # type: ignore[assignment]
+            sig_storage = SignalStorage(sf)
+            http_client = httpx.AsyncClient()
+            signals_runtime = SignalsRuntime(
+                registry=signal_registry,
+                storage=sig_storage,
+                clock=Clock(),
+                http=http_client,
+            )
+            # Pre-subscribe all signals declared in the roster.
+            for entry in roster.bots:
+                for sub in entry.signals:
+                    signals_runtime.subscribe(sub.name, dict(sub.params))
+            await signals_runtime.start()
+            logger.info("SignalsRuntime started.")
+        else:
+            logger.warning("POSTGRES_HOST not set — signals runtime disabled.")
+
         # Write PID file.
         pid_file = sock_path / "manager.pid"
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -172,6 +206,14 @@ def start(bots_file: str, sock_dir: str, secrets_dir: str) -> None:
         # Wait for stop signal.
         await stop_event.wait()
         await supervisor.stop()
+
+        # Shut down signals runtime.
+        if signals_runtime is not None:
+            await signals_runtime.stop()
+            logger.info("SignalsRuntime stopped.")
+        if http_client is not None:
+            await http_client.aclose()
+
         pid_file.unlink(missing_ok=True)
         logger.info("Manager stopped.")
 

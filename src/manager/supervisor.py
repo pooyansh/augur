@@ -40,6 +40,43 @@ from src.manager.config import BotEntry, BotsRoster
 from src.manager.heartbeat import HeartbeatServer
 from src.state.repository import AuditLogger, KillSwitchReader, StateRepository
 
+# ---------------------------------------------------------------------------
+# Signal validation helper
+# ---------------------------------------------------------------------------
+
+
+def validate_bot_signals(entry: BotEntry) -> None:
+    """Validate that all signals declared by a bot entry are registered.
+
+    Called before spawning a bot subprocess.  If any signal name is unknown
+    this raises a ``ValueError`` which causes the bot to fail to spawn with a
+    clear, actionable error.
+
+    Args:
+        entry: The bot roster entry whose ``signals`` list will be checked.
+
+    Raises:
+        ValueError: If any signal name in ``entry.signals`` is not registered
+            in the signals registry.
+    """
+    from src.signals.registry import signals as signal_registry
+
+    unknown = []
+    for sub in entry.signals:
+        try:
+            signal_registry.get(sub.name)
+        except KeyError:
+            unknown.append(sub.name)
+
+    if unknown:
+        available = signal_registry.names
+        raise ValueError(
+            f"Bot '{entry.id}' declares unknown signal(s) {unknown!r}. "
+            f"Registered signals: {available}. "
+            "Register the signal or remove it from the bot's config."
+        )
+
+
 logger = logging.getLogger(__name__)
 
 # Watchdog tick interval in seconds.
@@ -381,6 +418,10 @@ class Supervisor:
         Args:
             entry: The bot entry to spawn.
         """
+        # Validate signal subscriptions before doing anything else.
+        # Unknown signals fail fast with a clear error (invariant: fail-closed).
+        validate_bot_signals(entry)
+
         env = self._build_env(entry)
         mode_override: str | None = None
 
