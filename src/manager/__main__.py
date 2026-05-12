@@ -119,12 +119,17 @@ def start(
 
     from src.bots.base import Clock
     from src.manager.supervisor import Supervisor, SupervisorDeps, _default_spawn
+    from src.observability.logging import configure_logging
     from src.secrets.install import configure_logging_with_redaction
     from src.secrets.loader import load_secrets
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    # Configure structlog JSON logging first; redaction filter applied after secrets load.
+    log_dir_env = os.environ.get("LOG_DIR")
+    log_dir = Path(log_dir_env) if log_dir_env else None
+    configure_logging(
+        level=os.environ.get("LOG_LEVEL", "info"),
+        log_dir=log_dir,
+        process_name="manager",
     )
 
     loaded_secrets = load_secrets(Path(secrets_dir))
@@ -250,10 +255,17 @@ def start(
                     exc,
                 )
 
+            from src.observability.health import HealthChecker
+
+            health_checker = HealthChecker(
+                supervisor=supervisor,
+                session_factory=session_factory if session_factory is not None else None,
+            )
             dashboard_server = DashboardServer(
                 db=dashboard_db,
                 redactor=redactor,
                 supervisor=supervisor,
+                health_checker=health_checker,
             )
             await dashboard_server.start(host=dashboard_host, port=dashboard_port)
 

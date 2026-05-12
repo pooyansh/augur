@@ -138,6 +138,13 @@ uv run python -m src.manager start \
 
 All responses include `ETag` and `Cache-Control` headers; `If-None-Match` returns 304.
 
+The two machine-grade endpoints added in Phase 6a do **not** include ETag headers:
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/metrics` | Prometheus text format — scrape from Prometheus server via SSH tunnel |
+| `GET /api/healthz` | 200 healthy / 503 unhealthy; checks Postgres ping + all bot heartbeat ages |
+
 ### Security
 
 - v1 binds to `127.0.0.1` only. Passing `--dashboard-host` with a non-loopback value
@@ -147,6 +154,57 @@ All responses include `ETag` and `Cache-Control` headers; `If-None-Match` return
 - All free-form text (`last_error`, payloads) is passed through the Phase 3 redaction
   filter before leaving the API.
 - Public exposure + auth is a Phase 9 task.
+
+## Observability (Phase 6a)
+
+The platform exposes machine-grade observability on the same dashboard port (8090, loopback-only).
+
+### Prometheus metrics
+
+Scrape `GET /api/metrics` (Prometheus text format) via an SSH tunnel:
+
+```bash
+ssh -L 9090:127.0.0.1:8090 user@your-vps
+# Add to prometheus.yml:
+#   - targets: ["127.0.0.1:9090"]
+#     metrics_path: /api/metrics
+```
+
+Key metric families: `bot_tick_latency_seconds`, `bot_tick_overrun_total`,
+`bot_snapshot_lag_seconds`, `bot_heartbeat_age_seconds`, `order_intent_total`,
+`order_fill_latency_seconds`, `signal_fetch_total`, `signal_staleness_seconds`,
+`pnl_realized_usd`, `pnl_unrealized_usd`, `position_notional_usd`.
+
+Cardinality rule: `bot_id` and `strategy` are labels; `market_id` is **not**.
+
+### Health check
+
+`GET /api/healthz` returns 200 when Postgres is reachable and all bot heartbeats are within
+tolerance. Returns 503 with a diagnostic JSON body listing which checks failed. Suitable for
+load-balancer probes or uptime monitors.
+
+### Grafana dashboards
+
+Two Grafana dashboard JSONs are checked into `ops/grafana/`:
+- `bot-overview.json` — at-a-glance: tick latency p99, order intent rates, snapshot lag, PnL.
+- `per-bot-drilldown.json` — per-bot drill-down with `$bot_id` variable, heatmaps, and signal staleness.
+
+Import via Grafana's "Dashboards → Import → Upload JSON file". See `ops/grafana/README.md`.
+
+### SLOs
+
+Three operational budgets are documented in `ops/SLOs.md`:
+1. Tick on-time rate ≥ 99% (7-day rolling).
+2. Snapshot lag p99 < 60 s.
+3. Order placement success rate ≥ 99% (excluding deliberate `risk_blocked` / `kill_switch`).
+
+Budgets, not contracts — missing them prompts investigation, not a page.
+
+### Log rotation
+
+JSON logs are written to `LOG_DIR` (default `/var/log/manager/`). Configure logrotate with
+`ops/logrotate/manager.conf` — daily rotation, 14 days, compressed. See that file for
+installation instructions.
 
 ## Architecture
 

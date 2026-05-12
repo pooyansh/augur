@@ -147,9 +147,10 @@ def _make_client(
     """Build a TestClient for the dashboard router."""
     _db = db or _make_mock_db()
     redactor = JsonRedactor(secret_values or [])
-    router = make_router(db=_db, redactor=redactor, supervisor=supervisor)
+    api_router, ops_router = make_router(db=_db, redactor=redactor, supervisor=supervisor)
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(api_router)
+    app.include_router(ops_router)
     return TestClient(app)
 
 

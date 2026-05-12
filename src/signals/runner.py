@@ -239,9 +239,18 @@ class SignalsRuntime:
             tol = type(state.signal).tolerance_seconds
             # Stale = all sources have been failing AND the cached sample is
             # older than the tolerance window.
-            stale_flags[name] = state.last_fetch_attempt_failed and is_stale(
+            is_signal_stale = state.last_fetch_attempt_failed and is_stale(
                 cache.observed_at, tol, now
             )
+            stale_flags[name] = is_signal_stale
+            # Update staleness gauge with age since last observed sample.
+            try:
+                from src.observability.metrics import SIGNAL_STALENESS_SECONDS
+
+                age = (now - cache.observed_at).total_seconds()
+                SIGNAL_STALENESS_SECONDS.labels(signal=name).set(age)
+            except Exception:
+                pass
 
         return SignalSnapshot(
             samples=samples,
@@ -304,6 +313,16 @@ class SignalsRuntime:
                     source.name,
                     exc,
                 )
+                # Emit signal_fetch_total counter for the failure.
+                try:
+                    from src.observability.metrics import SIGNAL_FETCH_TOTAL
+
+                    err_label = "429" if "429" in str(exc) else "error"
+                    SIGNAL_FETCH_TOTAL.labels(
+                        signal=signal_name, source=source.name, result=err_label
+                    ).inc()
+                except Exception:
+                    pass
                 continue  # try next source
 
             latency_ms = int((time.monotonic() - t_start) * 1000)
@@ -358,6 +377,16 @@ class SignalsRuntime:
                 source.name,
                 latency_ms,
             )
+            # Emit success metric.
+            try:
+                from src.observability.metrics import SIGNAL_FETCH_TOTAL, SIGNAL_STALENESS_SECONDS
+
+                SIGNAL_FETCH_TOTAL.labels(
+                    signal=signal_name, source=source.name, result="success"
+                ).inc()
+                SIGNAL_STALENESS_SECONDS.labels(signal=signal_name).set(0.0)
+            except Exception:
+                pass
             return  # success — stop trying sources
 
         # All sources failed.

@@ -70,21 +70,27 @@ async def _run(bot_id: str) -> None:
     from src.manager.config import load_roster
     from src.manager.heartbeat import HeartbeatClient, SocketHeartbeat
     from src.manager.registry import registry
+    from src.observability.context import set_bot_id
+    from src.observability.logging import configure_logging
     from src.secrets.install import configure_logging_with_redaction
     from src.secrets.loader import Secrets, load_secrets
 
     # ------------------------------------------------------------------
     # 1. Logging + redaction
     # ------------------------------------------------------------------
+    log_dir_env = os.environ.get("LOG_DIR")
+    log_dir = Path(log_dir_env) if log_dir_env else None
+    configure_logging(
+        level=os.environ.get("LOG_LEVEL", "info"),
+        log_dir=log_dir,
+        process_name=f"bot-{bot_id}",
+    )
+    set_bot_id(bot_id)
+
     secrets_dir = Path(os.environ.get("SECRETS_DIR", "/run/secrets"))
     loaded_secrets = load_secrets(secrets_dir)
     configure_logging_with_redaction(loaded_secrets)
     secrets = Secrets(loaded_secrets)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
 
     # ------------------------------------------------------------------
     # 3. Load roster and find the bot entry

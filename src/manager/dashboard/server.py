@@ -45,6 +45,7 @@ class DashboardServer:
         db: Opened DashboardDb instance.
         redactor: JsonRedactor configured with current secret values.
         supervisor: Optional Supervisor for /api/status and /api/health.
+        health_checker: Optional HealthChecker for /healthz and /metrics.
     """
 
     def __init__(
@@ -52,10 +53,12 @@ class DashboardServer:
         db: DashboardDb,
         redactor: JsonRedactor,
         supervisor: Any | None = None,
+        health_checker: Any | None = None,
     ) -> None:
         self._db = db
         self._redactor = redactor
         self._supervisor = supervisor
+        self._health_checker = health_checker
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -74,12 +77,14 @@ class DashboardServer:
             redoc_url="/api/redoc",
         )
 
-        router = make_router(
+        api_router, ops_router = make_router(
             db=self._db,
             redactor=self._redactor,
             supervisor=self._supervisor,
+            health_checker=self._health_checker,
         )
-        app.include_router(router)
+        app.include_router(api_router)
+        app.include_router(ops_router)
 
         # Mount the SPA bundle if it exists.
         if _WEB_DIST.is_dir():

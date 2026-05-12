@@ -8,7 +8,19 @@ calls :meth:`HeartbeatServer.health` to detect silent crashes.
 Wire format (one JSON object per line, UTF-8)::
 
     {"bot_id": "echo-paper-1", "ts": "2026-05-09T12:00:00+00:00",
-     "snapshot_lag_s": 0.12, "last_error": null}
+     "snapshot_lag_s": 0.12, "last_error": null,
+     "metrics": {
+         "tick_latency_seconds_obs": [0.41, 0.39],
+         "tick_overrun_total": 0,
+         "order_intent_total": {"accepted": 4, "rejected": 0, "risk_blocked": 0, "kill_switch": 0},
+         "order_fill_latency_seconds_obs": [],
+         "position_notional_usd": 0.0,
+         "pnl_realized_usd": 0.0,
+         "pnl_unrealized_usd": 0.0
+     }}
+
+The ``metrics`` field is optional for backward compatibility; older bot
+versions that omit it are handled gracefully (no-op on the server side).
 
 The server is the socket *server*; the bot is the socket *client*.
 """
@@ -164,6 +176,24 @@ class HeartbeatServer:
                         ts_str,
                         snap_lag,
                     )
+                    # Phase 6a: apply metric updates from the heartbeat payload.
+                    if msg.get("metrics"):
+                        try:
+                            from src.observability.heartbeat_metrics import (
+                                apply_heartbeat_metrics,
+                            )
+
+                            apply_heartbeat_metrics(
+                                {
+                                    "bot_id": bot_id,
+                                    "ts": ts_str,
+                                    "snapshot_lag_s": snap_lag,
+                                    "last_error": last_error,
+                                    "metrics": msg["metrics"],
+                                }
+                            )
+                        except Exception as exc:
+                            logger.debug("Metric apply failed for %s: %s", bot_id, exc)
                 except (json.JSONDecodeError, ValueError, KeyError) as exc:
                     logger.warning("Malformed heartbeat from %s: %s", bot_id, exc)
         finally:
@@ -309,6 +339,46 @@ class HeartbeatClient:
         except (OSError, ConnectionResetError) as exc:
             logger.warning("HeartbeatClient write failed for %s: %s", self._bot_id, exc)
             self._writer = None  # force reconnect next tick
+
+    async def push_metrics(self, payload: dict[str, object]) -> None:
+        """Attach metric data to the next heartbeat beat and send it immediately.
+
+        Bundles ``payload`` into the ``metrics`` field of a heartbeat line and
+        sends it over the socket.  Connection failures are logged as warnings
+        and not propagated — metric pushes must never abort a tick.
+
+        Args:
+            payload: Dict matching the ``metrics`` wire-format shape defined in
+                the module docstring.  The caller (BaseBot) builds this dict
+                after each tick.
+        """
+        if self._writer is None or self._writer.is_closing():
+            ok = await self._connect()
+            if not ok:
+                return
+
+        now = self._clock.now()
+        snap_lag_s = (
+            (now - self._last_snapshot_at).total_seconds()
+            if self._last_snapshot_at is not None
+            else 0.0
+        )
+        msg = {
+            "bot_id": self._bot_id,
+            "ts": now.isoformat(),
+            "snapshot_lag_s": snap_lag_s,
+            "last_error": self._last_error,
+            "metrics": payload,
+        }
+        try:
+            assert self._writer is not None
+            self._writer.write((json.dumps(msg) + "\n").encode("utf-8"))
+            await self._writer.drain()
+        except (OSError, ConnectionResetError) as exc:
+            logger.warning(
+                "HeartbeatClient push_metrics write failed for %s: %s", self._bot_id, exc
+            )
+            self._writer = None  # force reconnect next time
 
     def record_snapshot(self) -> None:
         """Record the current time as the last snapshot time.

@@ -122,19 +122,98 @@ def make_router(
     db: DashboardDb,
     redactor: JsonRedactor,
     supervisor: Any | None = None,
-) -> APIRouter:
-    """Build and return the dashboard APIRouter.
+    health_checker: Any | None = None,
+) -> tuple[APIRouter, APIRouter]:
+    """Build and return the dashboard routers.
 
     Args:
         db: Opened DashboardDb instance for read-only queries.
         redactor: JsonRedactor for scrubbing free-form text fields.
         supervisor: Optional Supervisor instance for /api/status and /api/health;
             if None, those endpoints return minimal responses.
+        health_checker: Optional HealthChecker for /healthz; if None, the endpoint
+            returns a minimal 200 response.
 
     Returns:
-        Configured FastAPI APIRouter prefixed at ``/api``.
+        Tuple ``(api_router, ops_router)``. ``api_router`` is prefixed ``/api``
+        and serves the human-facing dashboard endpoints. ``ops_router`` is
+        unprefixed and serves ``/metrics`` (Prometheus convention) and
+        ``/healthz`` (machine health check) at the root path.
     """
     router = APIRouter(prefix="/api")
+    ops_router = APIRouter()
+
+    # ------------------------------------------------------------------
+    # GET /metrics  (Prometheus scrape endpoint — no ETag, no Cache-Control)
+    # Mounted at root (not /api) because Prometheus scrape configs expect
+    # /metrics by convention.
+    # ------------------------------------------------------------------
+
+    @ops_router.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        """Expose Prometheus metrics in the text exposition format.
+
+        ETag is intentionally omitted — Prometheus expects a fresh response on
+        every scrape and does not send If-None-Match.
+
+        Returns:
+            Prometheus text format body with the correct Content-Type header.
+        """
+        try:
+            from src.observability.metrics import render_metrics
+
+            body, content_type = render_metrics()
+            return Response(content=body, media_type=content_type)
+        except Exception as exc:
+            logger.error("Failed to render Prometheus metrics: %s", exc)
+            return Response(content=b"# metrics unavailable\n", media_type="text/plain")
+
+    # ------------------------------------------------------------------
+    # GET /healthz  (machine-grade health check — root path, not /api)
+    # ------------------------------------------------------------------
+
+    @ops_router.get("/healthz")
+    async def healthz_endpoint() -> Response:
+        """Return 200 when healthy, 503 when unhealthy.
+
+        Checks:
+        - Postgres is reachable (SELECT 1).
+        - All bot heartbeats are within tolerance.
+
+        The JSON body has the same shape regardless of status code so callers
+        can inspect which checks failed.
+
+        Returns:
+            JSON body with healthy, postgres_ok, bots list, and ts.
+        """
+        import json as _json
+
+        if health_checker is not None:
+            try:
+                report = await health_checker.check()
+            except Exception as exc:
+                logger.error("HealthChecker.check() failed: %s", exc)
+                report = {
+                    "healthy": False,
+                    "postgres_ok": False,
+                    "bots": [],
+                    "ts": datetime.now(UTC).isoformat(),
+                }
+        else:
+            # No health checker configured — return a minimal healthy response.
+            report = {
+                "healthy": True,
+                "postgres_ok": False,
+                "bots": [],
+                "ts": datetime.now(UTC).isoformat(),
+            }
+
+        status_code = 200 if report.get("healthy") else 503
+        return Response(
+            content=_json.dumps(report),
+            media_type="application/json",
+            status_code=status_code,
+        )
 
     # ------------------------------------------------------------------
     # GET /api/health
@@ -634,4 +713,4 @@ def make_router(
         _set_cache_headers(response, etag)
         return result
 
-    return router
+    return router, ops_router

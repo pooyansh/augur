@@ -28,6 +28,7 @@ __all__ = [
 import asyncio
 import logging
 import random as random_module
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -311,6 +312,17 @@ class BaseBot(ABC):
         # Warn callback — defaults to logger.warning; Phase 6 wires Slack/Discord.
         self._on_warn: Callable[[str], None] = lambda msg: logger.warning(msg)
 
+        # Phase 6a — per-tick metric accumulators (reset after each push).
+        self._tick_latency_obs: list[float] = []
+        self._tick_overrun_delta: int = 0
+        self._order_intent_delta: dict[str, int] = {
+            "accepted": 0,
+            "rejected": 0,
+            "risk_blocked": 0,
+            "kill_switch": 0,
+        }
+        self._fill_latency_obs: list[float] = []
+
         # Kill-switch cascade: issues cancel_all exactly once per trip period.
         self._ks_cascade = KillSwitchCascade(
             audit=deps.audit,
@@ -398,6 +410,21 @@ class BaseBot(ABC):
 
         while True:
             tick_start = self._deps.clock.now()
+            # Generate a deterministic tick correlation id.
+            tick_id = blake2s(
+                f"{self._config.bot_id}:{self._intent_seq}:{tick_start.isoformat()}".encode(),
+                digest_size=8,
+            ).hexdigest()
+
+            from contextvars import Token
+
+            _tick_token: Token[str | None] | None = None
+            try:
+                from src.observability.context import tick_id_var
+
+                _tick_token = tick_id_var.set(tick_id)
+            except Exception:
+                pass
 
             try:
                 # 1. Signals
@@ -419,8 +446,31 @@ class BaseBot(ABC):
                     # Switch is clear — reset cascade so next trip re-issues cancel_all.
                     self._ks_cascade.reset()
 
-                # 4. Strategy tick
+                # 4. Strategy tick — measure latency
+                on_tick_start = time.perf_counter()
                 decision = await self.on_tick(signals)
+                tick_duration = time.perf_counter() - on_tick_start
+
+                # Record latency and check for overrun.
+                self._tick_latency_obs.append(tick_duration)
+                if tick_duration > self._config.schedule.every_seconds:
+                    self._tick_overrun_delta += 1
+
+                # Update Prometheus directly on the manager side (if available).
+                try:
+                    from src.observability.metrics import BOT_TICK_LATENCY, BOT_TICK_OVERRUN_TOTAL
+
+                    BOT_TICK_LATENCY.labels(
+                        bot_id=self._config.bot_id,
+                        strategy=self._config.strategy_name,
+                    ).observe(tick_duration)
+                    if tick_duration > self._config.schedule.every_seconds:
+                        BOT_TICK_OVERRUN_TOTAL.labels(
+                            bot_id=self._config.bot_id,
+                            strategy=self._config.strategy_name,
+                        ).inc()
+                except Exception:
+                    pass  # metrics import optional — bot may run without observability pkg
 
                 # 5. Cancels
                 for coid in decision.cancels:
@@ -444,13 +494,22 @@ class BaseBot(ABC):
                 # 7. Snapshot (best-effort — invariant 6)
                 await self._persist_snapshot()
 
+                # 8. Push metric deltas via heartbeat (best-effort).
+                await self._push_tick_metrics()
+
             except asyncio.CancelledError:
                 logger.info("Bot %s cancelled, exiting run loop.", self._config.bot_id)
                 raise
             except Exception as exc:
                 logger.error("Unhandled error in bot %s run loop: %s", self._config.bot_id, exc)
+            finally:
+                if _tick_token is not None:
+                    import contextlib
 
-            # 8. Sleep until next tick
+                    with contextlib.suppress(Exception):
+                        tick_id_var.reset(_tick_token)
+
+            # 9. Sleep until next tick
             await self._sleep_until_next_tick(tick_start)
 
     async def place(self, intent_or_template: OrderIntent | OrderTemplate) -> OrderResult:
@@ -496,6 +555,17 @@ class BaseBot(ABC):
 
         # 2. Kill switch (fast path — checked again before every order)
         if await self._deps.kill_switch.is_tripped():
+            self._order_intent_delta["kill_switch"] += 1
+            try:
+                from src.observability.metrics import ORDER_INTENT_TOTAL
+
+                ORDER_INTENT_TOTAL.labels(
+                    bot_id=self._config.bot_id,
+                    strategy=self._config.strategy_name,
+                    result="kill_switch",
+                ).inc()
+            except Exception:
+                pass
             raise KillSwitchTripped("Kill switch is active; order blocked")
 
         # 3. Dedup — same client_order_id on retry returns cached result
@@ -507,7 +577,21 @@ class BaseBot(ABC):
             return self._inflight[intent.client_order_id]
 
         # 4. Risk caps
-        await self._check_risk_caps(intent)
+        try:
+            await self._check_risk_caps(intent)
+        except RiskCapExceeded:
+            self._order_intent_delta["risk_blocked"] += 1
+            try:
+                from src.observability.metrics import ORDER_INTENT_TOTAL
+
+                ORDER_INTENT_TOTAL.labels(
+                    bot_id=self._config.bot_id,
+                    strategy=self._config.strategy_name,
+                    result="risk_blocked",
+                ).inc()
+            except Exception:
+                pass
+            raise
 
         # Track recent order times for rate cap
         now = self._deps.clock.now()
@@ -545,6 +629,20 @@ class BaseBot(ABC):
 
         # 8. Cache result for idempotent retries
         self._inflight[intent.client_order_id] = result
+
+        # Track intent outcome for metrics.
+        result_label = "accepted" if result.accepted else "rejected"
+        self._order_intent_delta[result_label] += 1
+        try:
+            from src.observability.metrics import ORDER_INTENT_TOTAL
+
+            ORDER_INTENT_TOTAL.labels(
+                bot_id=self._config.bot_id,
+                strategy=self._config.strategy_name,
+                result=result_label,
+            ).inc()
+        except Exception:
+            pass
 
         return result
 
@@ -618,8 +716,59 @@ class BaseBot(ABC):
                 version=version,
                 state=snap,
             )
+            # After a successful snapshot, reset the lag gauge to 0.
+            try:
+                from src.observability.metrics import BOT_SNAPSHOT_LAG_SECONDS
+
+                BOT_SNAPSHOT_LAG_SECONDS.labels(bot_id=self._config.bot_id).set(0.0)
+            except Exception:
+                pass
         except Exception as exc:
             self._on_warn(f"Snapshot write failed for bot {self._config.bot_id}: {exc}")
+
+    async def _push_tick_metrics(self) -> None:
+        """Push accumulated metric deltas to the manager via the heartbeat client.
+
+        Best-effort: failures are logged at debug level and do not abort the tick.
+        Resets per-tick accumulators after a successful push.
+        """
+        from src.manager.heartbeat import HeartbeatClient, SocketHeartbeat
+
+        # Resolve the underlying HeartbeatClient if the heartbeat is a SocketHeartbeat.
+        hb = self._deps.heartbeat
+        client: HeartbeatClient | None = None
+        if isinstance(hb, SocketHeartbeat):
+            client = hb.client
+
+        if client is None:
+            # Not a socket heartbeat (unit tests use LocalHeartbeat) — skip push.
+            return
+
+        payload: dict[str, object] = {
+            "strategy": self._config.strategy_name,
+            "tick_latency_seconds_obs": list(self._tick_latency_obs),
+            "tick_overrun_total": self._tick_overrun_delta,
+            "order_intent_total": dict(self._order_intent_delta),
+            "order_fill_latency_seconds_obs": list(self._fill_latency_obs),
+            "position_notional_usd": float(self._position_notional),
+            "pnl_realized_usd": 0.0,
+            "pnl_unrealized_usd": 0.0,
+        }
+
+        try:
+            await client.push_metrics(payload)
+            # Reset accumulators after successful push.
+            self._tick_latency_obs.clear()
+            self._tick_overrun_delta = 0
+            self._order_intent_delta = {
+                "accepted": 0,
+                "rejected": 0,
+                "risk_blocked": 0,
+                "kill_switch": 0,
+            }
+            self._fill_latency_obs.clear()
+        except Exception as exc:
+            logger.debug("_push_tick_metrics failed (non-fatal): %s", exc)
 
     async def _sleep_until_next_tick(self, tick_start: datetime) -> None:
         """Sleep until the next scheduled tick boundary.
