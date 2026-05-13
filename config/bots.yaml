@@ -26,3 +26,27 @@ bots:
       max_orders_per_minute: 5
     secrets:
       exchange_credentials: "echo.dev"
+
+  # Phase 7 — momentum_v1 paper run on Polymarket.
+  # Market: "Will BTC be above $100K on 2026-12-31?"
+  # token_id: the YES outcome token for the above condition.
+  # Replace condition_id and token_id with the live market before running.
+  # Promote to live only via the three-lock rule (see CLAUDE.md invariant 1).
+  - id: momentum-v1-paper-1
+    strategy: momentum_v1
+    market:
+      exchange: polymarket
+      # condition_id for the target market — fill in before paper run
+      market_id: "REPLACE_WITH_CONDITION_ID"
+      # YES outcome token_id for the market above
+      token_id: "REPLACE_WITH_TOKEN_ID"
+    mode: paper
+    schedule: "every:900s"
+    signals:
+      - btc_15min
+    risk:
+      max_position_notional: "100"
+      max_daily_loss: "20"
+      max_orders_per_minute: 3
+    secrets:
+      exchange_credentials: "polymarket.paper"
