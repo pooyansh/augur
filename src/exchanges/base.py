@@ -18,6 +18,10 @@ __all__ = [
     "ExchangeEvent",
     "FillEvent",
     "Market",
+    "MarketClosedToTradingEvent",
+    "MarketFinalizedEvent",
+    "MarketOpenedEvent",
+    "MarketResolvedEvent",
     "Mode",
     "OrderIntent",
     "OrderResult",
@@ -240,8 +244,83 @@ class SettlementEvent:
     raw: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class MarketOpenedEvent:
+    """A market has opened for trading.
+
+    Args:
+        market_id: Canonical market identifier (condition_id for Polymarket).
+        token_id: ERC-1155 outcome token ID.
+        opened_at: UTC datetime when the market opened.
+    """
+
+    market_id: str
+    token_id: str
+    opened_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MarketClosedToTradingEvent:
+    """A market has stopped accepting new orders.
+
+    Note: On Polymarket, ``active`` does NOT flip on close.  Use
+    ``closed == false`` and ``accepting_orders == true`` to determine
+    tradability, not ``active``.
+
+    Args:
+        market_id: Canonical market identifier.
+        token_id: ERC-1155 outcome token ID.
+        closed_at: UTC datetime when trading closed.
+    """
+
+    market_id: str
+    token_id: str
+    closed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MarketResolvedEvent:
+    """A market has been resolved with a known payout.
+
+    Args:
+        market_id: Canonical market identifier.
+        token_id: ERC-1155 outcome token ID.
+        payout: Payout per share (0 or 1 for binary; fractional for scalar).
+        resolved_at: UTC datetime when resolution was published.
+    """
+
+    market_id: str
+    token_id: str
+    payout: Decimal
+    resolved_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MarketFinalizedEvent:
+    """A market has been finalized — payouts are claimable on-chain.
+
+    Args:
+        market_id: Canonical market identifier.
+        token_id: ERC-1155 outcome token ID.
+        finalized_at: UTC datetime when finalization occurred.
+    """
+
+    market_id: str
+    token_id: str
+    finalized_at: datetime
+
+
 #: Union type for all events the adapter may emit.
-ExchangeEvent = FillEvent | CancelEvent | RejectionEvent | SettlementEvent
+ExchangeEvent = (
+    FillEvent
+    | CancelEvent
+    | RejectionEvent
+    | SettlementEvent
+    | MarketOpenedEvent
+    | MarketClosedToTradingEvent
+    | MarketResolvedEvent
+    | MarketFinalizedEvent
+)
 
 
 # ---------------------------------------------------------------------------

@@ -131,7 +131,7 @@ class EchoAdapter(ExchangeAdapter):
 def make_adapter(exchange: str, mode: Mode) -> ExchangeAdapter:
     """Factory that resolves an exchange name to a concrete adapter.
 
-    Only ``"echo"`` is supported in Phase 5.  Polymarket is deferred to Phase 4.
+    Supports ``"echo"`` (in-memory simulator) and ``"polymarket"`` (Phase 4).
 
     Args:
         exchange: Venue name from ``MarketRef.exchange``.
@@ -142,12 +142,20 @@ def make_adapter(exchange: str, mode: Mode) -> ExchangeAdapter:
 
     Raises:
         NotImplementedError: If the exchange is not yet implemented.
+        RuntimeError: If polymarket config cannot be loaded from secrets.
     """
     if exchange == "echo":
         return EchoAdapter(mode)
-    # TODO: Add PolymarketAdapter when Phase 4 is implemented.
+
+    if exchange == "polymarket":
+        from src.exchanges.polymarket import PolymarketAdapter, load_polymarket_config
+        from src.secrets.loader import Secrets
+
+        secrets = Secrets.load()
+        raw_config = secrets.slice_for("exchanges.polymarket")
+        config = load_polymarket_config(raw_config)
+        return PolymarketAdapter(mode, config)
+
     raise NotImplementedError(
-        f"Exchange '{exchange}' is not yet implemented. "
-        "Only 'echo' is available in Phase 5. "
-        "Polymarket support is deferred to Phase 4."
+        f"Exchange '{exchange}' is not yet implemented. Available exchanges: 'echo', 'polymarket'."
     )
