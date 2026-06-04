@@ -91,10 +91,10 @@ class PolymarketConfig(BaseModel):
     l2_secret: str
     l2_passphrase: str
     wallet_address: str
-    signature_type: int  # 0=EOA, 1=proxy, 2=gnosis
-    max_allowance_usdc: Decimal
-    balance_ceiling_usdc: Decimal
-    allowance_cap_usdc: Decimal
+    signature_type: int = 0  # 0=EOA, 1=proxy, 2=gnosis
+    max_allowance_usdc: Decimal = Decimal("100000")
+    balance_ceiling_usdc: Decimal = Decimal("100000")
+    allowance_cap_usdc: Decimal = Decimal("100000")
     clob_host: str = "https://clob.polymarket.com"
     gamma_host: str = "https://gamma-api.polymarket.com"
     ws_host: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -1247,6 +1247,13 @@ def _parse_gamma_timestamp(raw: str | None) -> datetime:
 def load_polymarket_config(secrets_slice: dict[str, Any]) -> PolymarketConfig:
     """Build a :class:`PolymarketConfig` from a secrets slice.
 
+    Accepts the dict under the ``polymarket`` key of ``exchanges.enc.yaml``.
+    If it contains a ``live`` sub-key, that sub-dict is used (allows future
+    ``paper`` sub-key for separate paper credentials).
+
+    Field name aliases handled here:
+    - ``l2_api_secret`` → ``l2_secret`` (secrets file uses the longer name)
+
     Args:
         secrets_slice: Dict loaded from ``secrets/exchanges.enc.yaml``
             under the ``polymarket`` key.
@@ -1254,4 +1261,15 @@ def load_polymarket_config(secrets_slice: dict[str, Any]) -> PolymarketConfig:
     Returns:
         Validated :class:`PolymarketConfig`.
     """
-    return PolymarketConfig(**secrets_slice)
+    data = dict(secrets_slice.get("live", secrets_slice))
+
+    # Alias: secrets YAML uses l2_api_secret; PolymarketConfig uses l2_secret
+    if "l2_api_secret" in data and "l2_secret" not in data:
+        data["l2_secret"] = data.pop("l2_api_secret")
+
+    # YAML parses unquoted hex values as integers — coerce back to 0x strings.
+    for field in ("l1_private_key", "wallet_address"):
+        if field in data and isinstance(data[field], int):
+            data[field] = hex(data[field])
+
+    return PolymarketConfig(**data)

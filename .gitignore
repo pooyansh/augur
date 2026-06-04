@@ -67,3 +67,7 @@ logs/
 
 # --- Docker volumes (when generated locally) ---
 docker/volumes/
+
+# Session checkpoint files
+.claude/sessions/
+SESSION_STATE.md

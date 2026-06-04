@@ -309,14 +309,15 @@ class SigningModule:
         """
         import base64
 
-        timestamp = str(int(time.time() * 1000))
+        timestamp = str(int(time.time()))
         message = timestamp + method.upper() + path + body
+        # The secret is base64-encoded; decode it before use as the HMAC key.
         raw_signature = hmac.new(
-            key=self._l2_secret.encode("utf-8"),
+            key=base64.urlsafe_b64decode(self._l2_secret),
             msg=message.encode("utf-8"),
             digestmod=hashlib.sha256,
         ).digest()
-        sig_b64 = base64.b64encode(raw_signature).decode("utf-8")
+        sig_b64 = base64.urlsafe_b64encode(raw_signature).decode("utf-8")
 
         return {
             "POLY_ADDRESS": self._wallet_address,
