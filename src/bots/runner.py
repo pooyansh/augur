@@ -130,12 +130,39 @@ async def _run(bot_id: str) -> None:
     clock = Clock()
     session_factory = _build_session_factory()
 
+    signals_runtime = None
+    signals_http_client = None
+
     if session_factory is not None:
         from src.state.repository import AuditLogger, KillSwitchReader, StateRepository
 
         state = StateRepository(session_factory)  # type: ignore[arg-type]
         kill_switch = KillSwitchReader(session_factory)  # type: ignore[arg-type]
-        audit = AuditLogger(session_factory)  # type: ignore[arg-type]
+        audit = AuditLogger(session_factory)  # type: ignore[assignment]
+
+        # Build a per-bot SignalsRuntime so on_tick receives real signal data.
+        if entry.signals:
+            import httpx
+
+            from src.signals.registry import signals as signal_registry
+            from src.signals.runner import SignalsRuntime
+            from src.signals.storage import SignalStorage
+            from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+            signal_registry.autodiscover()
+            sf: async_sessionmaker[AsyncSession] = session_factory  # type: ignore[assignment]
+            sig_storage = SignalStorage(sf)
+            signals_http_client = httpx.AsyncClient()
+            signals_runtime = SignalsRuntime(
+                registry=signal_registry,
+                storage=sig_storage,
+                clock=clock,
+                http=signals_http_client,
+            )
+            for sub in entry.signals:
+                signals_runtime.subscribe(sub.name, dict(sub.params))
+            await signals_runtime.start()
+            logger.info("SignalsRuntime started for bot %s (%d signal(s)).", bot_id, len(entry.signals))
     else:
         # Offline / test path — use in-memory stubs.
         logger.warning("POSTGRES_HOST not set — using in-memory state stubs (no persistence).")
@@ -182,12 +209,8 @@ async def _run(bot_id: str) -> None:
         strategy_params=entry.params,
     )
 
-    # Build Market from the adapter.
-
-    market = await adapter.get_market(entry.market.market_id)
-
     # ------------------------------------------------------------------
-    # Resolve per-bot secret slice
+    # Resolve per-bot secret slice (before entering adapter context)
     # ------------------------------------------------------------------
     secrets_slice = None
     try:
@@ -199,69 +222,114 @@ async def _run(bot_id: str) -> None:
             bot_id,
         )
 
-    deps = BotDeps(
-        adapter=adapter,
-        state=state,
-        kill_switch=kill_switch,
-        heartbeat=heartbeat,
-        audit=audit,
-        clock=clock,
-        secrets_slice=secrets_slice,
-    )
-
     # ------------------------------------------------------------------
-    # 8. Construct strategy, rehydrate if snapshot exists
+    # Resolve market — slug-based markets need Gamma API lookup first.
+    # Static markets (market_id already set) use adapter.get_market().
     # ------------------------------------------------------------------
-    bot = strategy_class(market=market, config=bot_config, deps=deps)
+    if entry.market.slug is not None:
+        from src.exchanges.market_resolver import resolve_market
 
-    latest = await state.latest_snapshot(bot_id)
-    if latest is not None:
-        ver = latest.get("_version")
-        logger.info("Rehydrating bot %s from snapshot (version=%s).", bot_id, ver)
-        bot.rehydrate(latest)
+        logger.info(
+            "Resolving slug=%r outcome=%r for bot %s.",
+            entry.market.slug,
+            entry.market.outcome,
+            bot_id,
+        )
+        market = await asyncio.to_thread(resolve_market, entry.market)
+        # Propagate resolved IDs into BotConfig so audit/snapshot uses the real market_id.
+        bot_config = BotConfig(
+            bot_id=bot_config.bot_id,
+            strategy_name=bot_config.strategy_name,
+            market_id=market.market_id,
+            mode=bot_config.mode,
+            live=bot_config.live,
+            schedule=bot_config.schedule,
+            risk=bot_config.risk,
+            signal_subscriptions=bot_config.signal_subscriptions,
+            strategy_params=bot_config.strategy_params,
+        )
     else:
-        logger.info("No snapshot found for bot %s — starting fresh.", bot_id)
+        market = None  # resolved inside adapter context below
 
     # ------------------------------------------------------------------
-    # SIGTERM handler — write final snapshot then exit
+    # Enter adapter context (initialises HTTP client, wallet checks, etc.)
     # ------------------------------------------------------------------
-    loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-
-    def _on_sigterm() -> None:
-        logger.info("Bot %s received SIGTERM — initiating graceful shutdown.", bot_id)
-        shutdown_event.set()
-
-    loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-
-    # ------------------------------------------------------------------
-    # Run the bot
-    # ------------------------------------------------------------------
-    run_task = asyncio.create_task(bot.run(), name=f"bot-run-{bot_id}")
-
-    # Wait for either the bot to finish or SIGTERM.
     import contextlib
 
-    _done, _pending = await asyncio.wait(
-        [run_task, asyncio.create_task(shutdown_event.wait())],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    async with adapter:
+        # For static markets (no slug), fetch market metadata from CLOB now.
+        if market is None:
+            market = await adapter.get_market(entry.market.market_id)
 
-    # Cancel the run task if shutdown was signalled.
-    if not run_task.done():
-        run_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await run_task
+        deps = BotDeps(
+            adapter=adapter,
+            state=state,
+            kill_switch=kill_switch,
+            heartbeat=heartbeat,
+            audit=audit,
+            clock=clock,
+            secrets_slice=secrets_slice,
+            signals=signals_runtime,  # None → BaseBot falls back to InMemorySignals stub
+        )
 
-    # 9. Final snapshot on shutdown
-    try:
-        await bot._persist_snapshot()
-        logger.info("Final snapshot written for bot %s.", bot_id)
-    except Exception as exc:
-        logger.warning("Final snapshot write failed for bot %s: %s", bot_id, exc)
+        # ------------------------------------------------------------------
+        # 8. Construct strategy, rehydrate if snapshot exists
+        # ------------------------------------------------------------------
+        bot = strategy_class(market=market, config=bot_config, deps=deps)
 
-    # Close heartbeat
+        latest = await state.latest_snapshot(bot_id)
+        if latest is not None:
+            ver = latest.get("_version")
+            logger.info("Rehydrating bot %s from snapshot (version=%s).", bot_id, ver)
+            bot.rehydrate(latest)
+        else:
+            logger.info("No snapshot found for bot %s — starting fresh.", bot_id)
+
+        # ------------------------------------------------------------------
+        # SIGTERM handler — write final snapshot then exit
+        # ------------------------------------------------------------------
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        def _on_sigterm() -> None:
+            logger.info("Bot %s received SIGTERM — initiating graceful shutdown.", bot_id)
+            shutdown_event.set()
+
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+
+        # ------------------------------------------------------------------
+        # Run the bot
+        # ------------------------------------------------------------------
+        run_task = asyncio.create_task(bot.run(), name=f"bot-run-{bot_id}")
+
+        # Wait for either the bot to finish or SIGTERM.
+        _done, _pending = await asyncio.wait(
+            [run_task, asyncio.create_task(shutdown_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel the run task if shutdown was signalled.
+        if not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
+
+        # 9. Final snapshot on shutdown
+        try:
+            await bot._persist_snapshot()
+            logger.info("Final snapshot written for bot %s.", bot_id)
+        except Exception as exc:
+            logger.warning("Final snapshot write failed for bot %s: %s", bot_id, exc)
+
+    # Close heartbeat (outside adapter context — always runs)
     await hb_client.close()
+
+    # Stop signals runtime if one was started.
+    if signals_runtime is not None:
+        await signals_runtime.stop()
+    if signals_http_client is not None:
+        await signals_http_client.aclose()
+
     logger.info("Bot %s shutdown complete.", bot_id)
 
 

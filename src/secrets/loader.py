@@ -15,6 +15,7 @@ from __future__ import annotations
 __all__ = ["DEFAULT_SECRETS_DIR", "Secrets", "load_secrets"]
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SECRETS_DIR = Path("/run/secrets")
+DEFAULT_SECRETS_DIR = Path(os.environ.get("SECRETS_DIR", "/run/secrets"))
 
 
 def load_secrets(
