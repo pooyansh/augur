@@ -62,6 +62,12 @@ class MomentumV1(BaseBot):
 
     def __init__(self, market: Market, config: BotConfig, deps: BotDeps) -> None:
         super().__init__(market, config, deps)
+        p = config.strategy_params
+        self._momentum_threshold = Decimal(str(p.get("momentum_threshold_pct", self.MOMENTUM_THRESHOLD_PCT)))
+        self._target_size_cfg    = Decimal(str(p.get("target_size",             self.TARGET_SIZE)))
+        self._max_ticks          = int(p.get("max_ticks_in_position",           self.MAX_TICKS_IN_POSITION))
+        self._buy_price          = Decimal(str(p.get("buy_price",               self.BUY_PRICE)))
+        self._sell_price         = Decimal(str(p.get("sell_price",              self.SELL_PRICE)))
         self._prev_btc_price: Decimal | None = None
         self._position_size: Decimal = Decimal("0")
         self._ticks_in_position: int = 0
@@ -99,14 +105,14 @@ class MomentumV1(BaseBot):
 
             if self._position_size > 0:
                 self._ticks_in_position += 1
-                timeout = self._ticks_in_position >= self.MAX_TICKS_IN_POSITION
-                reversal = momentum_pct <= -self.MOMENTUM_THRESHOLD_PCT
+                timeout = self._ticks_in_position >= self._max_ticks
+                reversal = momentum_pct <= -self._momentum_threshold
                 if timeout or reversal:
                     intents.append(
                         OrderTemplate(
                             market=self._market,
                             side=Side.SELL,
-                            price=self.SELL_PRICE,
+                            price=self._sell_price,
                             size=self._position_size,
                         )
                     )
@@ -120,13 +126,13 @@ class MomentumV1(BaseBot):
                 else:
                     note = f"hold ticks={self._ticks_in_position} momentum={momentum_pct:.3f}%"
 
-            elif momentum_pct >= self.MOMENTUM_THRESHOLD_PCT:
-                buy_size = max(self.TARGET_SIZE, self._market.min_size)
+            elif momentum_pct >= self._momentum_threshold:
+                buy_size = max(self._target_size_cfg, self._market.min_size)
                 intents.append(
                     OrderTemplate(
                         market=self._market,
                         side=Side.BUY,
-                        price=self.BUY_PRICE,
+                        price=self._buy_price,
                         size=buy_size,
                     )
                 )

@@ -202,6 +202,7 @@ class BotConfig:
     schedule: Schedule
     risk: RiskCaps
     signal_subscriptions: list[str]
+    strategy_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

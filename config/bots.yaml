@@ -59,7 +59,15 @@ bots:
       outcome: "UP"
     mode: paper
     schedule: "every:300s"
-    signals: []
+    signals:
+      - name: btc_15min
+        params: {}
+    params:
+      momentum_threshold_pct: "0.3"
+      target_size: "5"
+      max_ticks_in_position: 3
+      buy_price: "0.35"
+      sell_price: "0.25"
     risk:
       max_position_notional: "50"
       max_daily_loss: "10"

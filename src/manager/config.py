@@ -201,6 +201,7 @@ class BotEntry(BaseModel):
     mode: Literal["paper", "live"] = "paper"
     schedule: str
     signals: list[SignalSubscription] = Field(default_factory=list)
+    params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskOverride
     secrets: SecretRef
     alerts: dict[str, Any] | None = None

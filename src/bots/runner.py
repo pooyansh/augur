@@ -179,6 +179,7 @@ async def _run(bot_id: str) -> None:
             max_orders_per_minute=risk_override.max_orders_per_minute,
         ),
         signal_subscriptions=[s.name for s in entry.signals],
+        strategy_params=entry.params,
     )
 
     # Build Market from the adapter.
