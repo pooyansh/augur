@@ -21,13 +21,14 @@ Required env:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import subprocess
 import sys
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -110,10 +111,11 @@ async def _buy(outcome: str, token_id: str, ask_price: Decimal, size: Decimal) -
 
     # Build a minimal Market object — tick_size/min_size not needed for signing
     market = Market(
-        market_id="",  # not used by the adapter for order placement
+        market_id="",
         token_id=token_id,
         tick_size=Decimal("0.01"),
         min_size=Decimal("5"),
+        venue="polymarket",
     )
 
     coid = hashlib.blake2s(
@@ -140,10 +142,88 @@ async def _buy(outcome: str, token_id: str, ask_price: Decimal, size: Decimal) -
         click.echo(f"  raw: {result.raw}", err=True)
 
 
+def _print(msg: str) -> None:
+    """Print with immediate flush — works correctly in both foreground and piped mode."""
+    click.echo(msg)
+    sys.stdout.flush()
+
+
+def _check_trigger(
+    ask_of: dict[str, Decimal],
+    side_of: dict[str, str],
+    trigger: Decimal,
+    fired: bool,
+) -> tuple[str, str, Decimal] | None:
+    """Return (outcome_name, token_id, ask) if any token is at or below trigger."""
+    if fired:
+        return None
+    for t_id, outcome_name in side_of.items():
+        ask = ask_of[t_id]
+        if ask > Decimal("0") and ask <= trigger:
+            return outcome_name, t_id, ask
+    return None
+
+
+async def _rest_poll_loop(
+    up_token: str,
+    dn_token: str,
+    ask_of: dict[str, Decimal],
+    side_of: dict[str, str],
+    trigger: Decimal,
+    size: Decimal,
+    window_end: float,
+    fired_flag: list[bool],
+) -> None:
+    """Poll REST /book every 15 s as a fallback trigger — catches moves WS may miss."""
+    while not fired_flag[0] and time.time() < window_end:
+        await asyncio.sleep(15)
+        if fired_flag[0] or time.time() >= window_end:
+            break
+        for t_id in (up_token, dn_token):
+            try:
+                r = httpx.get(f"{_CLOB_HOST}/book", params={"token_id": t_id}, timeout=5.0)
+                data = r.json()
+                asks = data.get("asks", [])
+                if not asks:
+                    continue
+                new_ask = min(Decimal(str(a["price"])) for a in asks if a.get("price"))
+                old_ask = ask_of[t_id]
+                if new_ask != old_ask:
+                    ask_of[t_id] = new_ask
+                    up_ask = ask_of[up_token]
+                    dn_ask = ask_of[dn_token]
+                    _print(
+                        f"[{_ts()}]  UP ask={up_ask:.2f}  DOWN ask={dn_ask:.2f}"
+                        f"  ← REST poll: {side_of[t_id]} {old_ask:.2f}→{new_ask:.2f}"
+                    )
+            except Exception:
+                pass
+
+        hit = _check_trigger(ask_of, side_of, trigger, fired_flag[0])
+        if hit:
+            fired_flag[0] = True
+            outcome_name, t_id, ask = hit
+            effective_size = _effective_size(size, ask)
+            _print(f"\n[{_ts()}] TRIGGER (REST poll) — {outcome_name} ask={ask:.2f} <= {trigger}")
+            await _buy(outcome_name, t_id, ask, effective_size)
+            _print(f"\n[{_ts()}] Done. Holding until window closes.")
+            return
+
+
+def _effective_size(size: Decimal, ask: Decimal) -> Decimal:
+    """Bump size up if needed to meet the $1.00 CLOB minimum notional."""
+    min_notional = Decimal("1.00")
+    if ask * size < min_notional:
+        bumped = (min_notional / ask).to_integral_value(rounding=ROUND_UP)
+        _print(f"[{_ts()}] Size {size} → {bumped} to meet $1 min notional")
+        return bumped
+    return size
+
+
 async def _watch_and_snipe(bot_id: str, trigger: Decimal, size: Decimal) -> None:
     import websockets
 
-    click.echo(f"\nResolving current window for {bot_id!r}...")
+    _print(f"\nResolving current window for {bot_id!r}...")
     tokens, _label, window_end = _resolve_both_tokens(bot_id)
 
     outcome_map = {k.lower(): (k, v) for k, v in tokens.items()}
@@ -151,98 +231,109 @@ async def _watch_and_snipe(bot_id: str, trigger: Decimal, size: Decimal) -> None
     dn_label, dn_token = outcome_map.get("down", outcome_map.get("no", ("Down", "")))
 
     if not up_token or not dn_token:
-        click.echo(f"ERROR: unexpected outcomes {list(tokens.keys())}", err=True)
+        _print(f"ERROR: unexpected outcomes {list(tokens.keys())}")
         sys.exit(1)
 
     side_of = {up_token: up_label, dn_token: dn_label}
     ask_of: dict[str, Decimal] = {up_token: Decimal("1"), dn_token: Decimal("1")}
+    fired_flag = [False]  # mutable so REST poller and WS loop share state
 
     secs_left = int(window_end - time.time())
-    click.echo(f"  UP   token: ...{up_token[-8:]}")
-    click.echo(f"  DOWN token: ...{dn_token[-8:]}")
-    click.echo(f"  Window closes in: {secs_left // 60}m {secs_left % 60:02d}s")
-    click.echo(f"  Trigger: ask ≤ {trigger}  |  Size: {size} shares")
-    click.echo(f"\n{'─' * 70}")
-    click.echo("  Watching... (Ctrl-C to abort)")
-    click.echo(f"{'─' * 70}\n")
+    _print(f"  UP   token: ...{up_token[-8:]}")
+    _print(f"  DOWN token: ...{dn_token[-8:]}")
+    _print(f"  Window closes in: {secs_left // 60}m {secs_left % 60:02d}s")
+    _print(f"  Trigger: ask <= {trigger}  |  Size: {size} shares")
+    _print(f"\n{'─' * 70}")
+    _print("  Watching via WS + REST poll every 15s... (Ctrl-C to abort)")
+    _print(f"{'─' * 70}\n")
 
-    fired = False
+    # Start REST polling fallback in background
+    poll_task = asyncio.create_task(
+        _rest_poll_loop(up_token, dn_token, ask_of, side_of, trigger, size, window_end, fired_flag)
+    )
+
     backoff = 1.0
 
-    while not fired:
-        if time.time() >= window_end:
-            click.echo(f"\n[{_ts()}] Window closed — no trigger fired. Exiting.")
-            return
+    try:
+        while not fired_flag[0]:
+            if time.time() >= window_end:
+                _print(f"\n[{_ts()}] Window closed — no trigger fired. Exiting.")
+                return
 
-        try:
-            async with websockets.connect(_WS_URL) as ws:
-                backoff = 1.0
-                sub = json.dumps({"type": "market", "assets_ids": [up_token, dn_token]})
-                await ws.send(sub)
+            try:
+                async with websockets.connect(_WS_URL) as ws:
+                    backoff = 1.0
+                    sub = json.dumps({"type": "market", "assets_ids": [up_token, dn_token]})
+                    await ws.send(sub)
 
-                async for raw in ws:
-                    if fired or time.time() >= window_end:
-                        break
-
-                    if not isinstance(raw, str):
-                        continue
-                    try:
-                        payload = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Parse ask prices from snapshot or price_change
-                    updates: list[tuple[str, list, list]] = []
-
-                    if isinstance(payload, list):
-                        for item in payload:
-                            t_id = item.get("asset_id", "")
-                            if t_id in side_of:
-                                updates.append((t_id, item.get("bids", []), item.get("asks", [])))
-
-                    elif isinstance(payload, dict):
-                        ev = payload.get("event_type", "")
-                        t_id = payload.get("asset_id", "")
-                        if ev == "price_change" and t_id in side_of:
-                            updates.append((t_id, payload.get("bids", []), payload.get("asks", [])))
-
-                    for t_id, _, asks in updates:
-                        if not asks:
+                    async for raw in ws:
+                        if fired_flag[0] or time.time() >= window_end:
+                            break
+                        if not isinstance(raw, str):
                             continue
-                        new_ask = min(Decimal(str(a["price"])) for a in asks if a.get("price"))
-                        old_ask = ask_of[t_id]
-                        ask_of[t_id] = new_ask
-                        outcome_name = side_of[t_id]
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
 
-                        # Log every price update so the user can see the stream
-                        up_ask = ask_of[up_token]
-                        dn_ask = ask_of[dn_token]
-                        moved = (
-                            f"  ← {outcome_name} {old_ask:.2f}→{new_ask:.2f}"
-                            if new_ask != old_ask
-                            else ""
-                        )
-                        click.echo(f"[{_ts()}]  UP ask={up_ask:.2f}  DOWN ask={dn_ask:.2f}{moved}")
+                        updates: list[tuple[str, list, list]] = []
 
-                        # Trigger check
-                        if new_ask <= trigger and not fired:
-                            fired = True
-                            click.echo(
-                                f"\n[{_ts()}] TRIGGER — {outcome_name} ask={new_ask:.2f}"
-                                f" <= {trigger}"
+                        if isinstance(payload, list):
+                            for item in payload:
+                                t_id = item.get("asset_id", "")
+                                if t_id in side_of:
+                                    updates.append(
+                                        (t_id, item.get("bids", []), item.get("asks", []))
+                                    )
+                        elif isinstance(payload, dict):
+                            ev = payload.get("event_type", "")
+                            t_id = payload.get("asset_id", "")
+                            if ev == "price_change" and t_id in side_of:
+                                updates.append(
+                                    (t_id, payload.get("bids", []), payload.get("asks", []))
+                                )
+
+                        for t_id, _, asks in updates:
+                            if not asks:
+                                continue
+                            new_ask = min(Decimal(str(a["price"])) for a in asks if a.get("price"))
+                            old_ask = ask_of[t_id]
+                            ask_of[t_id] = new_ask
+
+                            up_ask = ask_of[up_token]
+                            dn_ask = ask_of[dn_token]
+                            moved = (
+                                f"  ← {side_of[t_id]} {old_ask:.2f}→{new_ask:.2f}"
+                                if new_ask != old_ask
+                                else ""
                             )
-                            await _buy(outcome_name, t_id, new_ask, size)
-                            click.echo(f"\n[{_ts()}] Done. Holding until window closes.")
-                            return
+                            _print(f"[{_ts()}]  UP ask={up_ask:.2f}  DOWN ask={dn_ask:.2f}{moved}")
 
-        except asyncio.CancelledError:
-            raise
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            click.echo(f"[{_ts()}] WS error: {exc}  (reconnect in {backoff:.0f}s)", err=True)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
+                            hit = _check_trigger(ask_of, side_of, trigger, fired_flag[0])
+                            if hit:
+                                fired_flag[0] = True
+                                outcome_name, hit_id, ask = hit
+                                effective = _effective_size(size, ask)
+                                _print(
+                                    f"\n[{_ts()}] TRIGGER (WS) — {outcome_name}"
+                                    f" ask={ask:.2f} <= {trigger}"
+                                )
+                                await _buy(outcome_name, hit_id, ask, effective)
+                                _print(f"\n[{_ts()}] Done. Holding until window closes.")
+                                return
+
+            except asyncio.CancelledError:
+                raise
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                _print(f"[{_ts()}] WS error: {exc}  (reconnect in {backoff:.0f}s)")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+    finally:
+        poll_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poll_task
 
 
 @click.command()
