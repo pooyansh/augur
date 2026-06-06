@@ -20,7 +20,6 @@ import sys
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
-
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 
@@ -47,6 +46,7 @@ async def main() -> None:
         sys.exit(1)
 
     from eth_account import Account
+
     address = Account.from_key(private_key).address
 
     print("\n" + "=" * 60)

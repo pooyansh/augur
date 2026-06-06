@@ -47,3 +47,22 @@ bots:
       max_orders_per_minute: 3
     secrets:
       exchange_credentials: "polymarket.paper"
+
+  # BTC Up or Down — 5-minute recurring market on Polymarket.
+  # snipe_bot.py uses this entry with --bot-id btc-updown-5m-1.
+  # Window cadence is 300 s; market_resolver auto-detects from the slug suffix.
+  - id: btc-updown-5m-1
+    strategy: momentum_v1
+    market:
+      exchange: polymarket
+      slug: "btc-updown-5m"
+      outcome: "UP"
+    mode: paper
+    schedule: "every:300s"
+    signals: []
+    risk:
+      max_position_notional: "50"
+      max_daily_loss: "10"
+      max_orders_per_minute: 5
+    secrets:
+      exchange_credentials: "polymarket.live"

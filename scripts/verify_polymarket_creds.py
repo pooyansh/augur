@@ -12,8 +12,6 @@ Usage:
 import asyncio
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 import httpx
 import yaml
@@ -36,6 +34,7 @@ async def main() -> None:
     raw = decrypt_secrets()
 
     from src.exchanges.polymarket import load_polymarket_config
+
     config = load_polymarket_config(raw["polymarket"])
     print(f"  wallet_address : {config.wallet_address}")
     print(f"  l2_api_key     : {config.l2_api_key[:8]}...")
@@ -56,6 +55,7 @@ async def main() -> None:
         import hashlib
         import hmac
         import time
+
         ts = str(int(time.time()))
         msg = ts + "GET" + "/data/orders" + ""
         sig = hmac.new(

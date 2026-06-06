@@ -29,6 +29,22 @@ _CLOB_HOST = "https://clob.polymarket.com"
 _WINDOW_SECONDS = 900  # 15-minute recurring market cadence
 
 
+def _infer_window_seconds(slug: str) -> int:
+    """Return the window cadence in seconds from a slug's time-suffix (e.g. '5m', '15m', '1h')."""
+    import re
+
+    m = re.search(r"-(\d+)(m|h)(?:-\d+)?$", slug)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        return n * 60 if unit == "m" else n * 3600
+    # Prefix-only slug (e.g. "btc-updown-5m") — no trailing timestamp yet
+    m2 = re.search(r"-(\d+)(m|h)$", slug)
+    if m2:
+        n, unit = int(m2.group(1)), m2.group(2)
+        return n * 60 if unit == "m" else n * 3600
+    return _WINDOW_SECONDS
+
+
 def resolve_market(ref: MarketRef, *, http_timeout: float = 10.0) -> Market:
     """Resolve a :class:`~src.manager.config.MarketRef` to a concrete :class:`Market`.
 
@@ -63,9 +79,10 @@ def resolve_market(ref: MarketRef, *, http_timeout: float = 10.0) -> Market:
 
 def _resolve_slug(ref: MarketRef, *, http_timeout: float) -> Market:
     assert ref.slug is not None and ref.outcome is not None
+    win = _infer_window_seconds(ref.slug)
     now = int(time.time())
-    current = (now // _WINDOW_SECONDS) * _WINDOW_SECONDS
-    for window_ts in [current, current + _WINDOW_SECONDS, current + 2 * _WINDOW_SECONDS]:
+    current = (now // win) * win
+    for window_ts in [current, current + win, current + 2 * win]:
         full_slug = f"{ref.slug}-{window_ts}"
         try:
             market = _try_slug(full_slug, ref.outcome, ref.exchange, http_timeout=http_timeout)
@@ -75,7 +92,7 @@ def _resolve_slug(ref: MarketRef, *, http_timeout: float) -> Market:
             return market
     raise RuntimeError(
         f"No active market found for slug pattern {ref.slug!r} "
-        f"(tried 3 windows starting at ts={current})"
+        f"(tried 3 windows of {win}s starting at ts={current})"
     )
 
 
@@ -221,14 +238,16 @@ def _resolve_all_slug(ref: MarketRef, *, http_timeout: float) -> ResolvedMarket:
         RuntimeError: If no active window is found within the 3-window search.
     """
     assert ref.slug is not None
+    win = _infer_window_seconds(ref.slug)
     now = int(time.time())
-    current = (now // _WINDOW_SECONDS) * _WINDOW_SECONDS
-    for window_ts in [current, current + _WINDOW_SECONDS, current + 2 * _WINDOW_SECONDS]:
+    current = (now // win) * win
+    for window_ts in [current, current + win, current + 2 * win]:
         full_slug = f"{ref.slug}-{window_ts}"
         try:
             result = _try_all_slug(
                 full_slug,
                 window_ts,
+                win,
                 ref.exchange,
                 http_timeout=http_timeout,
             )
@@ -238,12 +257,12 @@ def _resolve_all_slug(ref: MarketRef, *, http_timeout: float) -> ResolvedMarket:
             return result
     raise RuntimeError(
         f"No active market found for slug pattern {ref.slug!r} "
-        f"(tried 3 windows starting at ts={current})"
+        f"(tried 3 windows of {win}s starting at ts={current})"
     )
 
 
 def _try_all_slug(
-    slug: str, window_ts: int, exchange: str, *, http_timeout: float
+    slug: str, window_ts: int, window_seconds: int, exchange: str, *, http_timeout: float
 ) -> ResolvedMarket | None:
     """Attempt to resolve all outcome tokens for a specific full slug.
 
@@ -288,7 +307,7 @@ def _try_all_slug(
         condition_id=condition_id,
         slug=slug,
         tokens=tokens,
-        window_end=float(window_ts + _WINDOW_SECONDS),
+        window_end=float(window_ts + window_seconds),
         tick_size=tick_size,
         min_size=min_size,
     )

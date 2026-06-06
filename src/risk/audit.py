@@ -29,6 +29,7 @@ __all__ = [
     "KIND_KILL_SWITCH_CANCEL_FAILED",
     "KIND_LIVE_DOWNGRADE",
     "KIND_MARKET_RESOLVED",
+    "KIND_MARKET_SETTLED",
     "KIND_ORDER_ACCEPTED",
     "KIND_ORDER_INTENT",
     "KIND_ORDER_REJECTED",
@@ -102,6 +103,7 @@ KIND_RISK_CAP_EXCEEDED = "risk_cap_exceeded"
 
 # Feed / market lifecycle
 KIND_MARKET_RESOLVED = "market_resolved"
+KIND_MARKET_SETTLED = "market_settled"
 KIND_FEED_STARTED = "feed_started"
 KIND_FEED_RECONNECTED = "feed_reconnected"
 KIND_FEED_ERROR = "feed_error"
