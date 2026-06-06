@@ -29,6 +29,7 @@ import httpx
 import yaml
 
 ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
 
 
 def _load_secrets() -> dict:
@@ -45,7 +46,14 @@ def _load_secrets() -> dict:
 
 
 def _clob_book(token_id: str) -> tuple[str, str]:
-    """Return (best_bid, best_ask) from the live CLOB order book."""
+    """Return (best_bid, best_ask) from the live CLOB order book.
+
+    Args:
+        token_id: ERC-1155 token ID to query.
+
+    Returns:
+        Tuple of (best_bid_str, best_ask_str) — em-dash if level absent.
+    """
     r = httpx.get(
         "https://clob.polymarket.com/book",
         params={"token_id": token_id},
@@ -71,7 +79,9 @@ async def _place(
     from src.exchanges.base import Mode, OrderIntent, Side
     from src.exchanges.market_resolver import resolve_market
     from src.exchanges.polymarket import PolymarketAdapter, load_polymarket_config
+    from src.infra.activity_logger import ActivityLogger
     from src.manager.config import load_roster
+    from src.risk.audit import KIND_ORDER_INTENT, KIND_ORDER_RESULT
 
     roster = load_roster(ROOT / "config" / "bots.yaml")
     entry = next((b for b in roster.bots if b.id == bot_id), None)
@@ -90,7 +100,7 @@ async def _place(
 
     ref = entry.market
     if outcome is not None:
-        # Override the configured outcome (UP→DOWN or vice versa) for this manual trade
+        # Override the configured outcome (UP->DOWN or vice versa) for this manual trade
         ref = ref.model_copy(update={"outcome": outcome.upper()})
 
     click.echo(f"Resolving market for bot {bot_id!r} (outcome={ref.outcome})...")
@@ -127,15 +137,39 @@ async def _place(
     if not yes:
         click.confirm("Place this LIVE order?", abort=True)
 
-    async with PolymarketAdapter(Mode.LIVE, config) as adapter:
-        result = await adapter.place(intent)
+    async with ActivityLogger.create(bot_id) as activity:
+        await activity.log(
+            KIND_ORDER_INTENT,
+            {
+                "side": side,
+                "price": str(price),
+                "size": str(size),
+                "token_id": market.token_id,
+                "market_id": market.market_id,
+            },
+            client_order_id=client_order_id,
+        )
 
-    if result.accepted:
-        click.echo(f"\n✓ Order accepted — exchange id: {result.exchange_order_id}")
-    else:
-        click.echo(f"\n✗ Order rejected — {result.reason}", err=True)
-        click.echo(f"  raw: {result.raw}", err=True)
-        sys.exit(1)
+        async with PolymarketAdapter(Mode.LIVE, config) as adapter:
+            result = await adapter.place(intent)
+
+        if result.accepted:
+            click.echo(f"\n  Order accepted -- exchange id: {result.exchange_order_id}")
+            await activity.log(
+                KIND_ORDER_RESULT,
+                {"accepted": True, "exchange_order_id": result.exchange_order_id},
+                client_order_id=client_order_id,
+                exchange_order_id=result.exchange_order_id,
+            )
+        else:
+            click.echo(f"\n  Order rejected -- {result.reason}", err=True)
+            click.echo(f"  raw: {result.raw}", err=True)
+            await activity.log(
+                KIND_ORDER_RESULT,
+                {"accepted": False, "reason": result.reason},
+                client_order_id=client_order_id,
+            )
+            sys.exit(1)
 
 
 @click.command()

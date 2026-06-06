@@ -19,6 +19,24 @@ inserts.  Corrections are new rows that reference the original row via
 from __future__ import annotations
 
 __all__ = [
+    "KIND_BOT_COOLDOWN",
+    "KIND_BOT_STARTED",
+    "KIND_BOT_STOPPED",
+    "KIND_ERROR",
+    "KIND_FEED_ERROR",
+    "KIND_FEED_RECONNECTED",
+    "KIND_FEED_STARTED",
+    "KIND_KILL_SWITCH_CANCEL_FAILED",
+    "KIND_LIVE_DOWNGRADE",
+    "KIND_MARKET_RESOLVED",
+    "KIND_ORDER_ACCEPTED",
+    "KIND_ORDER_INTENT",
+    "KIND_ORDER_REJECTED",
+    "KIND_ORDER_RESULT",
+    "KIND_ORDER_SUBMITTED",
+    "KIND_RISK_CAP_EXCEEDED",
+    "KIND_TRIGGER_FIRED",
+    "KIND_TRIGGER_MISSED",
     "AuditLogger",
     "AuditRecord",
 ]
@@ -81,3 +99,20 @@ KIND_KILL_SWITCH_CANCEL_FAILED = "kill_switch_cancel_failed"
 KIND_LIVE_DOWNGRADE = "live_downgrade"
 KIND_BOT_COOLDOWN = "bot_cooldown"
 KIND_RISK_CAP_EXCEEDED = "risk_cap_exceeded"
+
+# Feed / market lifecycle
+KIND_MARKET_RESOLVED = "market_resolved"
+KIND_FEED_STARTED = "feed_started"
+KIND_FEED_RECONNECTED = "feed_reconnected"
+KIND_FEED_ERROR = "feed_error"
+
+# Order events (generic, usable by all bots and scripts)
+KIND_ORDER_INTENT = "order_intent"
+KIND_ORDER_RESULT = "order_result"
+
+# Bot lifecycle
+KIND_BOT_STARTED = "bot_started"
+KIND_BOT_STOPPED = "bot_stopped"
+KIND_TRIGGER_FIRED = "trigger_fired"
+KIND_TRIGGER_MISSED = "trigger_missed"
+KIND_ERROR = "error"
