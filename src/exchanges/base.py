@@ -348,6 +348,13 @@ class ExchangeAdapter(ABC):
     def __init__(self, mode: Mode) -> None:
         self._mode = mode
 
+    async def __aenter__(self) -> "ExchangeAdapter":
+        """Enter the adapter context — subclasses override to open connections."""
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Exit the adapter context — subclasses override to close connections."""
+
     @property
     def mode(self) -> Mode:
         """Current execution mode of this adapter."""
