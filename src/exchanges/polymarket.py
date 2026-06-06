@@ -58,6 +58,10 @@ from src.exchanges.polymarket_signing import SigningModule
 
 logger = logging.getLogger(__name__)
 
+# Polygon mainnet contract addresses (public, not secrets)
+_USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon
+_CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Polymarket CTF Exchange
+
 # ---------------------------------------------------------------------------
 # Config model
 # ---------------------------------------------------------------------------
@@ -98,6 +102,7 @@ class PolymarketConfig(BaseModel):
     max_allowance_usdc: Decimal = Decimal("100000")
     balance_ceiling_usdc: Decimal = Decimal("100000")
     allowance_cap_usdc: Decimal = Decimal("100000")
+    polygon_rpc_url: str = "https://polygon-rpc.com"
     clob_host: str = "https://clob.polymarket.com"
     gamma_host: str = "https://gamma-api.polymarket.com"
     ws_host: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -230,33 +235,101 @@ class PolymarketAdapter(ExchangeAdapter):
     # Startup checks (live mode only)
     # ------------------------------------------------------------------
 
+    async def _rpc_eth_call(self, rpc_url: str, to: str, data: str) -> str:
+        """Issue a JSON-RPC eth_call and return the raw hex result string."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+        }
+        resp = await self._http.post(rpc_url, json=payload, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()["result"]
+
+    async def _rpc_erc20_uint256(
+        self, rpc_url: str, contract: str, selector_hex: str, *addr_args: str
+    ) -> int:
+        """Call an ERC-20 view that returns uint256; ABI-encode address args."""
+        encoded_args = "".join(a.lower().removeprefix("0x").zfill(64) for a in addr_args)
+        data = selector_hex + encoded_args
+        result = await self._rpc_eth_call(rpc_url, contract, data)
+        return int(result, 16) if result and result != "0x" else 0
+
     async def _startup_wallet_checks(self) -> None:
-        """Perform safety checks before allowing live trading.
+        """Perform on-chain safety checks before allowing live trading.
 
-        TODO(phase-4-wallet): Implement on-chain USDC allowance check.
-            This requires an RPC call to the Polygon network to read the
-            ERC-20 allowance of the wallet for the CTF Exchange contract.
-            Contract: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
-            If allowance > config.max_allowance_usdc, refuse to start and
-            emit a critical alert.
+        1. Signature type consistency (pure, no RPC).
+        2. USDC allowance cap — refuses startup if allowance > max_allowance_usdc.
+        3. USDC balance ceiling — warns if balance > balance_ceiling_usdc.
 
-        TODO(phase-4-wallet): Implement hot-wallet USDC balance ceiling check.
-            This requires an RPC call to check the wallet's USDC balance on
-            Polygon.  If balance > config.balance_ceiling_usdc, alert at warn.
-
-        TODO(phase-4-wallet): Verify signature_type matches wallet shape.
-            EOA wallets should use signature_type=0.  Proxy wallets use 1.
-            Gnosis Safe uses 2.  Mismatch → refuse to start.
+        RPC failures log at warning and do NOT block startup (best-effort).
         """
-        logger.warning(
-            "polymarket_startup_wallet_checks_stubbed",
-            extra={
-                "note": (
-                    "On-chain allowance and balance checks require Polygon RPC. "
-                    "Stubbed until Phase 4 wallet integration is complete."
-                )
-            },
+        cfg = self._config
+
+        # 1. Signature type consistency
+        if cfg.signature_type == 3 and cfg.deposit_wallet_address is None:
+            raise RuntimeError(
+                "signature_type=3 (POLY_1271) requires deposit_wallet_address to be set"
+            )
+        logger.info(
+            "polymarket_sig_type_ok",
+            extra={"signature_type": cfg.signature_type},
         )
+
+        # 2. USDC allowance check
+        try:
+            raw_allowance = await self._rpc_erc20_uint256(
+                cfg.polygon_rpc_url,
+                _USDC_POLYGON,
+                "0xdd62ed3e",  # allowance(address,address)
+                cfg.wallet_address,
+                _CTF_EXCHANGE,
+            )
+            allowance_usdc = Decimal(raw_allowance) / Decimal("1000000")
+            logger.info(
+                "polymarket_usdc_allowance_checked",
+                extra={"allowance_usdc": str(allowance_usdc), "cap": str(cfg.max_allowance_usdc)},
+            )
+            if allowance_usdc > cfg.max_allowance_usdc:
+                raise RuntimeError(
+                    f"On-chain USDC allowance {allowance_usdc} exceeds cap "
+                    f"{cfg.max_allowance_usdc}. Revoke or reduce before trading."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "polymarket_allowance_check_failed",
+                extra={"error": str(exc)},
+            )
+
+        # 3. USDC balance ceiling (warn only — does not block)
+        try:
+            raw_balance = await self._rpc_erc20_uint256(
+                cfg.polygon_rpc_url,
+                _USDC_POLYGON,
+                "0x70a08231",  # balanceOf(address)
+                cfg.wallet_address,
+            )
+            balance_usdc = Decimal(raw_balance) / Decimal("1000000")
+            logger.info(
+                "polymarket_usdc_balance_checked",
+                extra={"balance_usdc": str(balance_usdc), "ceiling": str(cfg.balance_ceiling_usdc)},
+            )
+            if balance_usdc > cfg.balance_ceiling_usdc:
+                logger.warning(
+                    "polymarket_hot_wallet_balance_high",
+                    extra={
+                        "balance_usdc": str(balance_usdc),
+                        "ceiling": str(cfg.balance_ceiling_usdc),
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "polymarket_balance_check_failed",
+                extra={"error": str(exc)},
+            )
 
     # ------------------------------------------------------------------
     # place
@@ -1328,17 +1401,9 @@ def load_polymarket_config(secrets_slice: dict[str, Any]) -> PolymarketConfig:
             data[field] = hex(data[field])
 
     # Auto-derive deposit wallet address if not explicitly provided.
-    # Pure CREATE2 math — no network call. The relayer client may be installed
-    # in the system Python (miniforge3) rather than the project venv, so we
-    # search both locations.
+    # Pure CREATE2 math — no network call.
     if "deposit_wallet_address" not in data and "wallet_address" in data:
         try:
-            import sys as _sys
-
-            _extra = "/Users/pooyan.shirvani/miniforge3/lib/python3.12/site-packages"
-            if _extra not in _sys.path:
-                _sys.path.insert(0, _extra)
-
             from py_builder_relayer_client.builder.derive import (  # type: ignore[import-untyped]
                 derive_uups_deposit_wallet,
             )

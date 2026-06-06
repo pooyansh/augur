@@ -1003,6 +1003,7 @@ dependencies = [
     { name = "httpx" },
     { name = "polars" },
     { name = "prometheus-client" },
+    { name = "py-builder-relayer-client" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1050,6 +1051,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7" },
     { name = "prometheus-client", specifier = ">=0.25.0" },
+    { name = "py-builder-relayer-client", specifier = ">=0.0.2" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -1125,6 +1127,24 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/61/7c/5c0d34aa3024694d6dcb9271cdbdd08c4e47c1c0ad95ec7e7bc74cdea145/propcache-0.5.2-cp312-cp312-win_amd64.whl", hash = "sha256:d9ee8826a7d47863a08ac44e1a5f611a462eefc3a194b492da242128bec75b42", size = 42322 },
     { url = "https://files.pythonhosted.org/packages/4d/91/875812f1a3feb20ceba818ef39fbe4d92f1081e04ac815c822496d0d038b/propcache-0.5.2-cp312-cp312-win_arm64.whl", hash = "sha256:2800a4a8ead6b28cccd1ec54b59346f0def7922ee1c7598e8499c733cfbb7c84", size = 38172 },
     { url = "https://files.pythonhosted.org/packages/3a/ed/1cdcab6ba3d6ab7feca11fc14f0eeea80755bb53ef4e892079f31b10a25f/propcache-0.5.2-py3-none-any.whl", hash = "sha256:be1ddfcbb376e3de5d2e2db1d58d6d67463e6b4f9f040c000de8e300295465fe", size = 14036 },
+]
+
+[[package]]
+name = "py-builder-relayer-client"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "eth-abi" },
+    { name = "eth-account" },
+    { name = "eth-utils" },
+    { name = "hexbytes" },
+    { name = "py-builder-signing-sdk" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f0/85/bca9addadc53e186fcb302e56955f08fabbe8db8d8f3f9da1beb2f1e212e/py_builder_relayer_client-0.0.2.tar.gz", hash = "sha256:6e570b0cbcd59115745daad3dfb4196c1ae4713771e7b66000731a836bf0e73c", size = 21038 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7d/9a/166109f2023d16715fcac8581893619303632280d84f8d71aa2509bcada1/py_builder_relayer_client-0.0.2-py3-none-any.whl", hash = "sha256:a5c34fff4aff412c4cec46139f89b9df4ce8719a39a167b0c18521ac90ac9463", size = 31910 },
 ]
 
 [[package]]

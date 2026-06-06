@@ -24,6 +24,7 @@ dependencies = [
     "prometheus-client>=0.25.0",
     "eth-account>=0.13",
     "web3>=7",
+    "py-builder-relayer-client>=0.0.2",
 ]
 
 [project.optional-dependencies]
