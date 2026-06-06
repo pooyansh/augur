@@ -9,6 +9,10 @@
 #   - secrets/ bind-mount (read-only) so the entrypoint can decrypt in dev
 
 services:
+  postgres:
+    ports:
+      - "5432:5432"
+
   manager:
     # Bind-mount src/ for live reloading during development.
     # The container image still contains a full copy of src/; this mount

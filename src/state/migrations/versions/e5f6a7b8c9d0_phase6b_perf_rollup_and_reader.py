@@ -1,7 +1,7 @@
 """phase6b: create perf_rollup materialized view and dashboard_reader role
 
 Revision ID: e5f6a7b8c9d0
-Revises: c3d4e5f6a7b8
+Revises: d4e5f6a7b8c9
 Create Date: 2026-05-09 02:00:00.000000
 
 Changes:
@@ -37,7 +37,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "e5f6a7b8c9d0"
-down_revision: str | Sequence[str] | None = "c3d4e5f6a7b8"
+down_revision: str | Sequence[str] | None = "d4e5f6a7b8c9"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
