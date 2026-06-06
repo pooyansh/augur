@@ -91,7 +91,10 @@ class PolymarketConfig(BaseModel):
     l2_secret: str
     l2_passphrase: str
     wallet_address: str
-    signature_type: int = 0  # 0=EOA, 1=proxy, 2=gnosis
+    signature_type: int = 0  # 0=EOA, 1=proxy, 2=gnosis, 3=POLY_1271
+    # Deposit wallet address — required when signature_type=3 (POLY_1271 flow).
+    # Derived deterministically from wallet_address via the deposit wallet factory.
+    deposit_wallet_address: str | None = None
     max_allowance_usdc: Decimal = Decimal("100000")
     balance_ceiling_usdc: Decimal = Decimal("100000")
     allowance_cap_usdc: Decimal = Decimal("100000")
@@ -157,13 +160,18 @@ class PolymarketAdapter(ExchangeAdapter):
         )
 
         if self._mode == Mode.LIVE:
+            # Auto-detect CLOB account version and select signing mode.
+            # Version 2 accounts use the POLY_1271 deposit wallet flow.
+            sig_type, dw_addr = await self._resolve_signing_mode()
+
             self._signing = SigningModule(
                 l1_private_key=self._config.l1_private_key,
                 l2_api_key=self._config.l2_api_key,
                 l2_secret=self._config.l2_secret,
                 l2_passphrase=self._config.l2_passphrase,
                 wallet_address=self._config.wallet_address,
-                signature_type=self._config.signature_type,
+                signature_type=sig_type,
+                deposit_wallet_address=dw_addr,
             )
             await self._startup_wallet_checks()
             await self.reconcile()
@@ -189,6 +197,34 @@ class PolymarketAdapter(ExchangeAdapter):
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+    # ------------------------------------------------------------------
+    # Signing mode resolution
+    # ------------------------------------------------------------------
+
+    async def _resolve_signing_mode(self) -> tuple[int, str | None]:
+        """Query the CLOB to determine the account's signing version.
+
+        Returns:
+            (signature_type, deposit_wallet_address):
+            - (3, dw_addr) for V2 POLY_1271 accounts (deposit wallet flow).
+            - (configured_sig_type, None) for V1 / EOA accounts.
+        """
+        assert self._http is not None
+        try:
+            r = await self._http.get(f"{self._config.clob_host}/version")
+            version: int = r.json().get("version", 1) if r.status_code == 200 else 1
+        except Exception:
+            version = 1
+
+        if version == 2 and self._config.deposit_wallet_address:
+            logger.info(
+                "polymarket_v2_account_detected",
+                extra={"deposit_wallet": self._config.deposit_wallet_address},
+            )
+            return 3, self._config.deposit_wallet_address
+
+        return self._config.signature_type, self._config.deposit_wallet_address
 
     # ------------------------------------------------------------------
     # Startup checks (live mode only)
@@ -269,9 +305,19 @@ class PolymarketAdapter(ExchangeAdapter):
 
         wire = signed.to_wire()
         body_str = json.dumps(
-            {"order": wire, "owner": self._config.wallet_address, "orderType": "GTC"}
+            {
+                "order": wire,
+                "owner": self._config.l2_api_key,
+                "orderType": "GTC",
+                "postOnly": False,
+                "deferExec": False,
+            }
         )
-        headers = self._signing.build_l2_headers("POST", "/order", body_str)
+        logger.info("polymarket_place_wire_payload", extra={"payload": body_str})
+        headers = {
+            "Content-Type": "application/json",
+            **self._signing.build_l2_headers("POST", "/order", body_str),
+        }
 
         try:
             resp = await self._http.post(
@@ -761,7 +807,9 @@ class PolymarketAdapter(ExchangeAdapter):
             return
 
         try:
-            orders: list[dict[str, Any]] = resp.json()
+            raw = resp.json()
+            # API returns either a list or a paginated dict {"data": [...]}
+            orders: list[dict[str, Any]] = raw if isinstance(raw, list) else raw.get("data", [])
         except Exception as exc:
             logger.warning(
                 "polymarket_reconcile_parse_failed",
@@ -1254,6 +1302,13 @@ def load_polymarket_config(secrets_slice: dict[str, Any]) -> PolymarketConfig:
     Field name aliases handled here:
     - ``l2_api_secret`` → ``l2_secret`` (secrets file uses the longer name)
 
+    Deposit wallet auto-derivation:
+    - If ``deposit_wallet_address`` is not in secrets, it is derived
+      deterministically from ``wallet_address`` using the Polymarket deposit
+      wallet factory (CREATE2 math, no network call required).
+    - If the derived address is present in secrets, the secrets value takes
+      precedence (allows overriding for non-standard setups).
+
     Args:
         secrets_slice: Dict loaded from ``secrets/exchanges.enc.yaml``
             under the ``polymarket`` key.
@@ -1271,5 +1326,33 @@ def load_polymarket_config(secrets_slice: dict[str, Any]) -> PolymarketConfig:
     for field in ("l1_private_key", "wallet_address"):
         if field in data and isinstance(data[field], int):
             data[field] = hex(data[field])
+
+    # Auto-derive deposit wallet address if not explicitly provided.
+    # Pure CREATE2 math — no network call. The relayer client may be installed
+    # in the system Python (miniforge3) rather than the project venv, so we
+    # search both locations.
+    if "deposit_wallet_address" not in data and "wallet_address" in data:
+        try:
+            import sys as _sys
+
+            _extra = "/Users/pooyan.shirvani/miniforge3/lib/python3.12/site-packages"
+            if _extra not in _sys.path:
+                _sys.path.insert(0, _extra)
+
+            from py_builder_relayer_client.builder.derive import (  # type: ignore[import-untyped]
+                derive_uups_deposit_wallet,
+            )
+            from py_builder_relayer_client.config import (  # type: ignore[import-untyped]
+                get_contract_config as _get_relayer_cfg,
+            )
+
+            _rc = _get_relayer_cfg(137)
+            data["deposit_wallet_address"] = derive_uups_deposit_wallet(
+                data["wallet_address"],
+                _rc.deposit_wallet_factory,
+                _rc.deposit_wallet_implementation,
+            )
+        except Exception:
+            pass  # derivation unavailable; leave as None
 
     return PolymarketConfig(**data)

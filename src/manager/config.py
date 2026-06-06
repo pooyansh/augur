@@ -31,14 +31,57 @@ from pydantic import BaseModel, Field, model_validator
 class MarketRef(BaseModel):
     """Reference to a specific market on a specific exchange.
 
+    Two forms are supported:
+
+    **Static** — the market IDs are known ahead of time::
+
+        exchange: polymarket
+        market_id: "0xabc..."   # condition_id
+        token_id: "123..."      # ERC-1155 outcome token (polymarket only)
+
+    **Dynamic** — the concrete IDs are resolved at runtime via the venue API::
+
+        exchange: polymarket
+        slug: "btc-updown-15m"  # slug prefix; resolver appends the current window timestamp
+        outcome: "UP"           # which token to trade (UP/DOWN/YES/NO)
+
     Args:
-        exchange: Venue name — one of ``"polymarket"``, ``"kalshi"``,
-            ``"echo"``.  Phase 5 ships the ``echo`` stub only.
-        market_id: Canonical market identifier on that venue.
+        exchange: Venue name — one of ``"polymarket"``, ``"kalshi"``, ``"echo"``.
+        market_id: Canonical market identifier (static markets only).
+        token_id: ERC-1155 outcome token ID (polymarket static markets only).
+        slug: Slug prefix for dynamic/recurring markets resolved at runtime.
+        outcome: Outcome name for dynamic markets (e.g. ``"UP"``, ``"DOWN"``).
     """
 
     exchange: Literal["polymarket", "kalshi", "echo"]
-    market_id: str
+    market_id: str | None = None
+    token_id: str | None = None
+    slug: str | None = None
+    outcome: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_spec(self) -> Self:
+        has_slug = self.slug is not None
+        if has_slug:
+            if self.market_id is not None or self.token_id is not None:
+                raise ValueError(
+                    "Specify either slug (dynamic) or market_id/token_id (static), not both."
+                )
+            if self.outcome is None:
+                raise ValueError("slug requires outcome (e.g. 'UP', 'DOWN', 'YES', 'NO').")
+            return self
+        # Static path: market_id is required
+        if self.market_id is None:
+            raise ValueError(
+                "market_id is required for static markets (or use slug for dynamic resolution)."
+            )
+        # token_id required for Polymarket (ERC-1155 outcome token)
+        if self.exchange == "polymarket" and self.token_id is None:
+            raise ValueError(
+                "token_id is required for polymarket static markets. "
+                "Use slug + outcome for dynamic/recurring markets."
+            )
+        return self
 
 
 class SignalSubscription(BaseModel):

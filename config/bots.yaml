@@ -27,26 +27,23 @@ bots:
     secrets:
       exchange_credentials: "echo.dev"
 
-  # Phase 7 — momentum_v1 paper run on Polymarket.
-  # Market: "Will BTC be above $100K on 2026-12-31?"
-  # token_id: the YES outcome token for the above condition.
-  # Replace condition_id and token_id with the live market before running.
+  # BTC Up or Down — 15-minute recurring market on Polymarket.
+  # slug resolves to the active window at bot startup (e.g. btc-updown-15m-1780607700).
+  # outcome selects which ERC-1155 token to trade; "UP" = price higher at window close.
   # Promote to live only via the three-lock rule (see CLAUDE.md invariant 1).
-  - id: momentum-v1-paper-1
+  - id: btc-updown-paper-1
     strategy: momentum_v1
     market:
       exchange: polymarket
-      # condition_id for the target market — fill in before paper run
-      market_id: "REPLACE_WITH_CONDITION_ID"
-      # YES outcome token_id for the market above
-      token_id: "REPLACE_WITH_TOKEN_ID"
+      slug: "btc-updown-15m"
+      outcome: "UP"
     mode: paper
     schedule: "every:900s"
     signals:
-      - btc_15min
+      - name: btc_15min
     risk:
-      max_position_notional: "100"
-      max_daily_loss: "20"
+      max_position_notional: "50"
+      max_daily_loss: "10"
       max_orders_per_minute: 3
     secrets:
       exchange_credentials: "polymarket.paper"
