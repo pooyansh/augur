@@ -1,0 +1,58 @@
+[project]
+name = "ml"
+version = "0.1.0"
+description = "Offline dataset collection + training pipeline (sibling package to src/; never imported by src/)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "polars>=1.0",
+    "httpx>=0.27",
+    "tenacity>=8",
+    "click>=8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "respx>=0.23",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["data_collection"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# ---------------------------------------------------------------------------
+# Mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+strict = true
+python_version = "3.12"
+explicit_package_bases = true
+mypy_path = ".."
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]

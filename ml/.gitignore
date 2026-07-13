@@ -1,0 +1,5 @@
+# Generated dataset output — never committed. Only code + SCHEMA.md docs are.
+data/
+
+# uv venv artifact for this sibling project (uv.lock IS committed, per 00-stack.md rule 0a)
+.venv/
