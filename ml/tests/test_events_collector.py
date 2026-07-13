@@ -1,4 +1,4 @@
-"""Unit tests for the Tier 1 Gamma ``/events`` collector.
+"""Unit tests for the Tier 1 Gamma ``/events/keyset`` collector.
 
 All HTTP is mocked via ``respx`` — no real network calls in this suite.
 """
@@ -24,7 +24,7 @@ from ml.data_collection.events import (
     write_schema_doc,
 )
 
-_GAMMA_URL = "https://gamma-api.polymarket.com/events"
+_GAMMA_URL = "https://gamma-api.polymarket.com/events/keyset"
 
 _BASE_CREATED = datetime(2025, 1, 1, tzinfo=UTC)
 _BASE_START = datetime(2025, 6, 1, tzinfo=UTC)
@@ -75,55 +75,67 @@ def make_event(
     }
 
 
-def make_fake_gamma_handler(
-    events_by_series: dict[str, list[dict[str, Any]]], offset_ceiling: int
+def make_fake_gamma_keyset_handler(
+    events_by_series: dict[str, list[dict[str, Any]]],
+    *,
+    server_max_page_size: int = 100,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Build a respx side_effect simulating Gamma's real (buggy) pagination.
+    """Build a respx side_effect simulating Gamma's real ``/events/keyset`` behavior.
 
-    Honors ``series_id``, ``closed``, ``start_date_min``, ``limit``, ``offset``
-    like the real API. Returns HTTP 422 once ``offset`` exceeds
-    ``offset_ceiling``, mirroring the real "offset too large" behavior.
+    Honors ``series_id``, ``closed``, ``start_date_min``, ``limit`` (silently
+    clamped to ``server_max_page_size``, mirroring the real API — a requested
+    ``limit`` above the server's cap is *not* rejected, it's just truncated,
+    which means a page shorter than the *requested* limit is NOT a valid
+    end-of-results signal), and ``after_cursor`` (an opaque cursor — here just
+    an index into the filtered/sorted pool, since the mock only needs to
+    round-trip it faithfully, not match the real opaque encoding).
+
+    Termination is only ever signalled by an empty ``events`` list, exactly
+    like production.
     """
 
     def _handler(request: httpx.Request) -> httpx.Response:
         params = dict(request.url.params)
         series_id = params.get("series_id", "")
         start_date_min = params.get("start_date_min", "")
-        limit = int(params.get("limit", 100))
-        offset = int(params.get("offset", 0))
-
-        if offset > offset_ceiling:
-            return httpx.Response(
-                422,
-                json={
-                    "type": "validation error",
-                    "error": "offset too large, use /events/keyset for deeper pagination",
-                },
-            )
+        requested_limit = int(params.get("limit", 100))
+        effective_limit = min(requested_limit, server_max_page_size)
+        after_cursor = params.get("after_cursor")
+        start_index = int(after_cursor) if after_cursor else 0
 
         pool = events_by_series.get(series_id, [])
         filtered = sorted(
             (e for e in pool if e["startDate"] >= start_date_min),
-            key=lambda e: e["startDate"],
+            key=lambda e: (e["startDate"], e["slug"]),
         )
-        page = filtered[offset : offset + limit]
-        return httpx.Response(200, json=page)
+        page = filtered[start_index : start_index + effective_limit]
+        next_index = start_index + len(page)
+        return httpx.Response(
+            200,
+            json={
+                "$schema": "https://gamma-api.polymarket.com/schemas/EventsKeysetListResponse.json",
+                "events": page,
+                "next_cursor": str(next_index),
+            },
+        )
 
     return _handler
 
 
 @respx.mock
-def test_pagination_crosses_offset_ceiling_without_duplicates_or_gaps() -> None:
+def test_pagination_advances_via_after_cursor_without_duplicates_or_gaps() -> None:
     series_id = "999"
     series_slug = "fake-series-a"
     total_windows = 260
     events = [
         make_event(i, series_id=series_id, series_slug=series_slug) for i in range(total_windows)
     ]
-    handler = make_fake_gamma_handler({series_id: events}, offset_ceiling=100)
+    # Server clamps pages to 50 even though we request page_limit=200 below —
+    # this proves collection doesn't stop early on a "short" (50 < 200) page.
+    handler = make_fake_gamma_keyset_handler({series_id: events}, server_max_page_size=50)
     respx.get(_GAMMA_URL).mock(side_effect=handler)
 
-    df = collect_events(series_id, venue="polymarket", closed=True, page_limit=50)
+    df = collect_events(series_id, venue="polymarket", closed=True, page_limit=200)
 
     assert df.height == total_windows
     assert df["window_slug"].n_unique() == total_windows
@@ -140,7 +152,7 @@ def test_missing_final_price_does_not_crash_collection() -> None:
         make_event(1, series_id=series_id, series_slug=series_slug, missing_final_price=True),
         make_event(2, series_id=series_id, series_slug=series_slug),
     ]
-    handler = make_fake_gamma_handler({series_id: events}, offset_ceiling=1000)
+    handler = make_fake_gamma_keyset_handler({series_id: events})
     respx.get(_GAMMA_URL).mock(side_effect=handler)
 
     df = collect_events(series_id, page_limit=100)
@@ -160,7 +172,7 @@ def test_manifest_sha256_is_stable_for_identical_inputs() -> None:
     series_id = "777"
     series_slug = "fake-series-c"
     events = [make_event(i, series_id=series_id, series_slug=series_slug) for i in range(5)]
-    handler = make_fake_gamma_handler({series_id: events}, offset_ceiling=1000)
+    handler = make_fake_gamma_keyset_handler({series_id: events})
     respx.get(_GAMMA_URL).mock(side_effect=handler)
 
     df = collect_events(series_id, page_limit=100)
@@ -199,7 +211,7 @@ def test_money_fields_round_trip_through_parquet_as_strings(tmp_path: Path) -> N
     series_id = "666"
     series_slug = "fake-series-d"
     events = [make_event(i, series_id=series_id, series_slug=series_slug) for i in range(3)]
-    handler = make_fake_gamma_handler({series_id: events}, offset_ceiling=1000)
+    handler = make_fake_gamma_keyset_handler({series_id: events})
     respx.get(_GAMMA_URL).mock(side_effect=handler)
 
     df = collect_events(series_id, page_limit=100)
@@ -218,9 +230,7 @@ def test_output_path_partitioned_by_venue_and_series_no_collision(tmp_path: Path
     series_id_b, series_slug_b = "222", "fake-series-f"
     events_a = [make_event(i, series_id=series_id_a, series_slug=series_slug_a) for i in range(2)]
     events_b = [make_event(i, series_id=series_id_b, series_slug=series_slug_b) for i in range(2)]
-    handler = make_fake_gamma_handler(
-        {series_id_a: events_a, series_id_b: events_b}, offset_ceiling=1000
-    )
+    handler = make_fake_gamma_keyset_handler({series_id_a: events_a, series_id_b: events_b})
     respx.get(_GAMMA_URL).mock(side_effect=handler)
 
     df_a = collect_events(series_id_a, page_limit=100)

@@ -1,4 +1,4 @@
-"""Tier 1 collector — Gamma ``/events`` for a recurring-market series.
+"""Tier 1 collector — Gamma ``/events/keyset`` for a recurring-market series.
 
 Pulls every closed event (settlement window) for a given Polymarket Gamma
 series id and returns one row per window as a Polars DataFrame. Generalizes
@@ -17,48 +17,48 @@ Gamma exposes two pagination mechanisms for events:
   refuses requests past a server-side offset ceiling (observed ~2000 for a
   filtered ``series_id``+``closed`` query as of 2026-07-13) with HTTP 422:
   ``{"error": "offset too large, use /events/keyset for deeper pagination"}``.
-* cursor-based pagination on ``/events/keyset`` — per Gamma's own error
-  message this is the documented answer to the offset ceiling. **It does
-  not work as documented, verified empirically against the live prod API
-  on 2026-07-13:**
-    - Resending the same filters (``series_id``, ``closed``, ``order``,
-      ``ascending``) plus ``cursor=<next_cursor>`` returns the *identical
-      first page* again, repeatably, across many trials — the returned
-      ``next_cursor`` value doesn't even change between calls, meaning the
-      server is not incorporating the inbound cursor into its query at all
-      whenever query filters are present.
-    - Dropping the filters and sending only ``cursor`` + ``limit`` doesn't
-      fix it either: it silently drops the filter context and returns
-      whatever the *global* (all-series) keyset page 1 is — completely
-      unrelated markets (NBA/NFL), not ``series_id=10684`` continued. That
-      "page" is also static across repeated calls with the same cursor.
-  In short: under every combination tried, the inbound ``cursor`` value is
-  never actually consumed/advanced by the server. This looks like a
-  server-side bug in the deployed Gamma API, not a client usage error — but
-  we can't rule out an undocumented required shape (e.g. a POST body) we
-  didn't think to try. Given the working fallback below, we didn't sink
-  further time into it.
+* cursor-based pagination on ``/events/keyset`` — this is what we use below.
+  An earlier version of this module claimed ``/events/keyset``'s cursor was
+  never consumed by the server. **That was wrong — it was a client-side bug
+  in our own testing, not a Gamma bug.** The response field is
+  ``next_cursor``, but the *request* parameter that must be sent back on the
+  following call is **``after_cursor``**, not ``cursor``. Sending ``cursor``
+  is silently ignored (the server just serves keyset page 1 again), which is
+  what created the earlier impression of a broken/unresponsive cursor.
+  Confirmed against Gamma's own published OpenAPI spec
+  (``https://gamma-api.polymarket.com/openapi.json``, publicly served, no
+  auth — the authoritative source of truth for this API and worth checking
+  there before assuming undocumented behavior is a server bug) and verified
+  live: paginating with ``after_cursor`` correctly advances through distinct,
+  non-overlapping pages.
 
-Working approach — date-fenced offset pagination
---------------------------------------------------
-Plain ``/events`` supports a ``start_date_min`` filter (event ``startDate``
->= the given ISO timestamp; ``startDate`` is Gamma's internal
-record-creation-ish timestamp, monotonically close to but not identical to
-the window's actual trading start — it is only used here as an ordering/
-fencing key, never stored as ``start_ts``). We page normally with
-offset/limit, sorted ascending by ``startDate``, until the API returns the
-422 "offset too large" error. At that point we take the maximum
-``startDate`` seen so far, set ``start_date_min`` to that value, reset
-``offset`` back to ``0``, and resume ("advance the fence"). This never
-depends on knowing the exact offset ceiling — we just react to the 422 —
-and it terminates when a page comes back shorter than the requested limit
-(the true end of the result set). Rows that straddle a fence boundary
-(events can share the same millisecond-precision ``startDate``) are
-deduplicated by ``window_slug`` before being yielded.
+  Two more real behaviors worth recording here, since they are easy to get
+  wrong and are not obvious from the spec alone:
 
-If a future Gamma deploy fixes ``/events/keyset`` cursor pagination, it
-could replace this fencing scheme — re-verify with the same black-box test
-described above before relying on it again.
+  1. **The server silently clamps the requested ``limit``** — observed max
+     page size is 100 for this endpoint, even when a larger ``limit`` is
+     requested. A page shorter than the requested ``limit`` does **not**
+     mean the result set is exhausted (unlike plain ``/events``). The only
+     reliable end-of-results signal is an **empty** ``events`` list.
+  2. ``series_id=10684`` (BTC Up or Down 5m) is a live, continuously-running
+     series — new closed windows appear roughly every 5 minutes. A
+     collection run naturally terminates once it catches up to "now" and
+     receives an empty page; it is not a fixed, static result set.
+
+Working approach — keyset (``after_cursor``) pagination
+--------------------------------------------------------
+``/events/keyset`` supports the same ``start_date_min`` filter as plain
+``/events`` (event ``startDate`` >= the given ISO timestamp; ``startDate`` is
+Gamma's internal record-creation-ish timestamp, monotonically close to but
+not identical to the window's actual trading start — it is only used here as
+an ordering/resume key, never stored as ``start_ts``). We page with
+``after_cursor`` set to the previous response's ``next_cursor``, sorted
+ascending by ``startDate``, until a page comes back with an empty ``events``
+list (the true end of the result set — see clamping note above for why a
+short-but-nonempty page is not a valid stop condition). This endpoint has no
+offset ceiling, so no date-fencing/reset workaround is needed. Events are
+still deduplicated by ``window_slug`` before being yielded, as a defensive
+measure against any future server-side duplication.
 """
 
 from __future__ import annotations
@@ -83,7 +83,6 @@ from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 import polars as pl
 
 from ml.data_collection.http_client import GammaHttpClient
@@ -257,59 +256,48 @@ def _iter_event_rows(
     start_date_min: str,
     page_limit: int,
 ) -> Iterator[dict[str, Any]]:
-    """Yield parsed event rows via date-fenced offset pagination. See module docstring."""
-    fence = start_date_min
+    """Yield parsed event rows via ``/events/keyset`` cursor pagination.
+
+    See the module docstring for why ``after_cursor`` (not ``cursor``) is the
+    correct request parameter, and why an empty ``events`` list — not a page
+    shorter than ``page_limit`` — is the only valid termination signal.
+    """
+    after_cursor: str | None = None
     seen_slugs: set[str] = set()
 
     while True:
-        offset = 0
-        fence_max_start_date: str | None = None
-        advanced_in_fence = False
+        params: dict[str, Any] = {
+            "series_id": series_id,
+            "closed": str(closed).lower(),
+            "limit": page_limit,
+            "order": "startDate",
+            "ascending": "true",
+            "start_date_min": start_date_min,
+        }
+        if after_cursor is not None:
+            params["after_cursor"] = after_cursor
 
-        while True:
-            params: dict[str, Any] = {
-                "series_id": series_id,
-                "closed": str(closed).lower(),
-                "limit": page_limit,
-                "offset": offset,
-                "order": "startDate",
-                "ascending": "true",
-                "start_date_min": fence,
-            }
-            try:
-                page = client.get("/events", params=params)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 422:
-                    break  # Offset ceiling hit for this fence — advance it.
-                raise
+        page = client.get("/events/keyset", params=params)
+        events = page.get("events") or []
 
-            if not page:
-                return  # Fully exhausted: no more windows at all.
+        if not events:
+            return  # True end of the result set.
 
-            for raw_event in page:
-                raw_start_date = raw_event.get("startDate")
-                if isinstance(raw_start_date, str) and (
-                    fence_max_start_date is None or raw_start_date > fence_max_start_date
-                ):
-                    fence_max_start_date = raw_start_date
+        for raw_event in events:
+            slug = raw_event.get("slug")
+            if slug is None or slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
 
-                slug = raw_event.get("slug")
-                if slug is None or slug in seen_slugs:
-                    continue
-                seen_slugs.add(slug)
-                advanced_in_fence = True
+            row = _parse_event_row(raw_event, venue=venue, series_id=series_id)
+            if row is not None:
+                yield row
 
-                row = _parse_event_row(raw_event, venue=venue, series_id=series_id)
-                if row is not None:
-                    yield row
-
-            if len(page) < page_limit:
-                return  # Last page of the entire result set.
-            offset += page_limit
-
-        if fence_max_start_date is None or not advanced_in_fence:
-            return  # Nothing new in this fence — avoid an infinite loop.
-        fence = fence_max_start_date
+        next_cursor = page.get("next_cursor")
+        if not next_cursor:
+            return  # No cursor to continue with — defensive; server always
+            # returns one on a nonempty page in practice.
+        after_cursor = next_cursor
 
 
 def collect_events(
