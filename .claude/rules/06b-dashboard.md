@@ -10,6 +10,25 @@
      `GET`-only. Tests in `tests/integration/test_dashboard_readonly_role.py`
      prove the role-level enforcement.
 
+1a. **Invariant 1 is a database invariant; one narrow, deliberate exception exists.**
+   `POST /api/control/bots/{bot_id}/stop` is the *only* non-GET route in the
+   entire dashboard surface. It is a same-process call directly into
+   `Supervisor.stop_bot()` — it touches zero Postgres rows, so it does not
+   violate "dashboard never writes to the DB" (that invariant is specifically
+   about the database, not about HTTP verbs generally). It is:
+   - **Separately routed**: `/api/control/...`, its own file
+     (`src/manager/dashboard/control_api.py`), never added to the read-only
+     `router`/`ops_router` in `api.py`.
+   - **Audit-logged**: every invocation writes a `KIND_BOT_STOP_REQUESTED`
+     row via the same `AuditLogger` instance used elsewhere in the manager
+     process, before the HTTP response returns.
+   - **Loopback-only**: bound via the same `DashboardServer.start(host, port)`
+     call as everything else — no separate bind, no exception to invariant 4.
+
+   This is the *only* write-like route and must stay that way. Any future
+   dashboard feature that wants to mutate anything needs its own explicit
+   justification here — this exception is not precedent for adding more.
+
 2. **All aggregation lives in materialized views or in the client.**
    API handlers MUST NOT run ad-hoc `SELECT ... GROUP BY` queries against raw
    tables. If a new aggregation is needed, add a new materialized view
@@ -72,6 +91,7 @@
 | `/api/audit` | `audit_log` | Paginated, filtered |
 | `/api/failures` | `audit_log` | Last 7 days, failure kinds only |
 | `/api/capital` | `bot_state.state.balance` | Phase 4 wallet probe pending |
+| `POST /api/control/bots/{id}/stop` | `Supervisor.stop_bot()` | The sole non-GET route — see invariant 1a |
 
 ## Refresh cadence (client-side, visibility-aware)
 

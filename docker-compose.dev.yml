@@ -23,6 +23,10 @@ services:
         target: /app/src
       # secrets bind-mount is already in the base compose; kept here for
       # clarity but the base file is authoritative.
+    ports:
+      # Operator dashboard — loopback-only; overridden here only to keep the
+      # mapping explicit in dev too (base compose already declares it).
+      - "127.0.0.1:8090:8090"
 
   # ---------------------------------------------------------------------------
   # pgadmin — dev-only database GUI.

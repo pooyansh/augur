@@ -22,6 +22,7 @@ __all__ = [
     "KIND_BOT_COOLDOWN",
     "KIND_BOT_STARTED",
     "KIND_BOT_STOPPED",
+    "KIND_BOT_STOP_REQUESTED",
     "KIND_ERROR",
     "KIND_FEED_ERROR",
     "KIND_FEED_RECONNECTED",
@@ -124,6 +125,7 @@ KIND_ORDER_RESULT = "order_result"
 # Bot lifecycle
 KIND_BOT_STARTED = "bot_started"
 KIND_BOT_STOPPED = "bot_stopped"
+KIND_BOT_STOP_REQUESTED = "bot_stop_requested"
 KIND_TRIGGER_FIRED = "trigger_fired"
 KIND_TRIGGER_MISSED = "trigger_missed"
 KIND_ERROR = "error"

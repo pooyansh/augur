@@ -29,6 +29,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from src.manager.dashboard.api import make_router
+from src.manager.dashboard.control_api import make_control_router
 from src.manager.dashboard.db import DashboardDb
 from src.manager.dashboard.redact import JsonRedactor
 
@@ -44,8 +45,12 @@ class DashboardServer:
     Args:
         db: Opened DashboardDb instance.
         redactor: JsonRedactor configured with current secret values.
-        supervisor: Optional Supervisor for /api/status and /api/health.
+        supervisor: Optional Supervisor for /api/status, /api/health, and the
+            control router's stop-bot action.
         health_checker: Optional HealthChecker for /healthz and /metrics.
+        audit: Optional AuditLogger, reused (not reconstructed) for the
+            control router's audit trail. Required for the control router to
+            be mounted — without it there's nowhere to log a stop request.
     """
 
     def __init__(
@@ -54,11 +59,13 @@ class DashboardServer:
         redactor: JsonRedactor,
         supervisor: Any | None = None,
         health_checker: Any | None = None,
+        audit: Any | None = None,
     ) -> None:
         self._db = db
         self._redactor = redactor
         self._supervisor = supervisor
         self._health_checker = health_checker
+        self._audit = audit
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -85,6 +92,16 @@ class DashboardServer:
         )
         app.include_router(api_router)
         app.include_router(ops_router)
+
+        # Control router — the dashboard's sole non-GET surface. Mounted only
+        # when both a supervisor and an audit logger are available, since the
+        # route calls into both. See src/manager/dashboard/control_api.py.
+        if self._supervisor is not None and self._audit is not None:
+            control_router = make_control_router(
+                supervisor=self._supervisor,
+                audit=self._audit,
+            )
+            app.include_router(control_router)
 
         # Mount the SPA bundle if it exists.
         if _WEB_DIST.is_dir():

@@ -397,14 +397,7 @@ class Supervisor:
 
         # Remove bots no longer in the roster.
         for bot_id in removed_ids:
-            bp = self._running.pop(bot_id)
-            _send_signal(bp.proc, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(bp.proc.wait(), timeout=30.0)
-            except TimeoutError:
-                _send_signal(bp.proc, signal.SIGKILL)
-                await bp.proc.wait()
-            self._heartbeat_server.remove_bot(bot_id)
+            await self.stop_bot(bot_id, grace_s=30.0)
             logger.info("Reload: removed bot %s", bot_id)
 
         # Spawn new bots.
@@ -420,6 +413,36 @@ class Supervisor:
             removed=sorted(removed_ids),
             unchanged=sorted(unchanged_ids),
         )
+
+    async def stop_bot(self, bot_id: str, *, grace_s: float = 30.0) -> bool:
+        """Stop one running bot by id: SIGTERM, wait up to ``grace_s``, then SIGKILL.
+
+        This is the on-demand, single-bot analogue of ``reload()``'s
+        removed-bot handling — both share this implementation.
+
+        Args:
+            bot_id: The bot to stop.
+            grace_s: Seconds to wait for a clean exit before sending SIGKILL.
+
+        Returns:
+            ``True`` if the bot was running and is now stopped. ``False`` if
+            it wasn't running — this is a no-op, not an error.
+        """
+        bp = self._running.pop(bot_id, None)
+        if bp is None:
+            return False
+
+        _send_signal(bp.proc, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(bp.proc.wait(), timeout=grace_s)
+        except TimeoutError:
+            logger.warning("Bot %s did not exit within grace period — sending SIGKILL.", bot_id)
+            _send_signal(bp.proc, signal.SIGKILL)
+            await bp.proc.wait()
+
+        self._heartbeat_server.remove_bot(bot_id)
+        logger.info("Stopped bot %s", bot_id)
+        return True
 
     def status(self) -> list[BotStatus]:
         """Return the current status of all supervised bots.
