@@ -8,7 +8,13 @@ depends on and that never depends on ``src/`` internals either.
 
 from __future__ import annotations
 
-__all__ = ["GammaHttpClient", "RetryableStatusError", "TokenBucket"]
+__all__ = [
+    "GammaHttpClient",
+    "RetryableHttpClient",
+    "RetryableStatusError",
+    "TokenBucket",
+    "TradesApiHttpClient",
+]
 
 import time
 from types import TracebackType
@@ -74,8 +80,9 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, httpx.TransportError | RetryableStatusError)
 
 
-class GammaHttpClient:
-    """Retryable, rate-limited GET client for the Gamma public API.
+class RetryableHttpClient:
+    """Retryable, rate-limited GET client shared by all public read-only APIs
+    this package talks to (Gamma, the Data API, ...).
 
     Non-2xx/3xx responses other than 429/5xx (e.g. 404, 422) are surfaced as
     ``httpx.HTTPStatusError`` immediately — those are deterministic API
@@ -85,15 +92,14 @@ class GammaHttpClient:
 
     Args:
         base_url: API root, e.g. ``https://gamma-api.polymarket.com``.
-        rate_per_sec: Sustained request rate. Gamma has no published public
-            rate limit; ``5.0`` req/s is a conservative default.
+        rate_per_sec: Sustained request rate.
         burst: Token bucket burst capacity.
         timeout: Per-request timeout in seconds.
     """
 
     def __init__(
         self,
-        base_url: str = "https://gamma-api.polymarket.com",
+        base_url: str,
         *,
         rate_per_sec: float = 5.0,
         burst: int = 5,
@@ -146,3 +152,42 @@ class GammaHttpClient:
             raise RetryableStatusError(response.status_code, response.text)
         response.raise_for_status()
         return response.json()
+
+
+class GammaHttpClient(RetryableHttpClient):
+    """Retryable, rate-limited GET client for the Gamma public API.
+
+    Gamma has no published public rate limit; ``5.0`` req/s is a conservative
+    default.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "https://gamma-api.polymarket.com",
+        *,
+        rate_per_sec: float = 5.0,
+        burst: int = 5,
+        timeout: float = 10.0,
+    ) -> None:
+        super().__init__(base_url, rate_per_sec=rate_per_sec, burst=burst, timeout=timeout)
+
+
+class TradesApiHttpClient(RetryableHttpClient):
+    """Retryable, rate-limited GET client for ``data-api.polymarket.com``.
+
+    This host has no documented public rate limit either (unlike Gamma, we
+    have no prior operational experience with it at all). ``5.0`` req/s is a
+    conservative starting default, not a value verified against a published
+    limit — back off (lower ``rate_per_sec``) if 429s are observed in
+    practice.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "https://data-api.polymarket.com",
+        *,
+        rate_per_sec: float = 5.0,
+        burst: int = 5,
+        timeout: float = 10.0,
+    ) -> None:
+        super().__init__(base_url, rate_per_sec=rate_per_sec, burst=burst, timeout=timeout)
