@@ -422,9 +422,19 @@ def test_different_client_order_ids_produce_different_salts() -> None:
 
 
 def test_salt_derivation_option_b_formula() -> None:
-    """Verify Option B formula: first 16 hex chars → big-endian int."""
+    """Verify Option B formula: first 10 hex chars (5 bytes) → big-endian int.
+
+    Deliberately 5 bytes, not the originally-documented 8: a full 8-byte
+    salt can exceed JavaScript's MAX_SAFE_INTEGER (2^53 - 1). The CLOB
+    parses ``salt`` as a JSON number, so an oversized salt loses precision
+    client-side and causes signature verification failures. 5 bytes caps
+    the salt at 2^40, safely within range. See ``derive_salt``'s docstring
+    in ``src/exchanges/polymarket_signing.py`` for the full rationale —
+    this is the actual, live-trading-verified behavior; the 8-byte formula
+    in an earlier version of ``.claude/rules/05-exchanges.md`` was stale.
+    """
     coid = "abcdef0123456789feedbeefdeadcafe"
-    expected = int.from_bytes(bytes.fromhex("abcdef0123456789"), "big")
+    expected = int.from_bytes(bytes.fromhex(coid[:10]), "big")
     assert derive_salt(coid) == expected
 
 

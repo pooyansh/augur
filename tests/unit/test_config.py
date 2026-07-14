@@ -205,8 +205,14 @@ def test_invalid_schedule_strings_rejected(bad_schedule: str) -> None:
 
 def test_valid_exchanges_accepted() -> None:
     """All supported exchange values are accepted."""
-    for exchange in ("polymarket", "kalshi", "echo"):
-        data = _make_roster([_make_entry(market={"exchange": exchange, "market_id": "TEST"})])
+    markets: dict[str, dict[str, object]] = {
+        # Polymarket static markets require token_id (see MarketRef's validator).
+        "polymarket": {"exchange": "polymarket", "market_id": "TEST", "token_id": "12345"},
+        "kalshi": {"exchange": "kalshi", "market_id": "TEST"},
+        "echo": {"exchange": "echo", "market_id": "TEST"},
+    }
+    for exchange, market in markets.items():
+        data = _make_roster([_make_entry(market=market)])
         roster = BotsRoster.model_validate(data)
         assert roster.bots[0].market.exchange == exchange
 
