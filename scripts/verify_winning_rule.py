@@ -22,6 +22,7 @@ Required env:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import time
 from dataclasses import dataclass
@@ -36,7 +37,6 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.snipe_bot import (  # noqa: E402
     _buy,
-    _check_clob_settlement,
     _effective_size,
     _poll_settlement,
     _resolve_next_window,
@@ -71,7 +71,7 @@ async def _fetch_btc_price() -> tuple[Decimal, str] | None:
             raw = await source.fetch({})
             parsed = signal.parse(source_cls.name, raw)
             return Decimal(parsed["price_usd"]), parsed["source"]
-        except Exception as exc:  # noqa: BLE001 -- fall through to next source
+        except Exception as exc:
             click.echo(f"[{_ts()}] price fetch via {source_cls.name} failed: {exc}", err=True)
     return None
 
@@ -118,10 +118,8 @@ async def _price_poll_loop(
             now = datetime.now(tz=UTC)
             latest["sample"] = (price, source, now)
             click.echo(f"[{_ts()}] BTC price={price} (source={source})")
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=_PRICE_POLL_SECS)
-        except asyncio.TimeoutError:
-            pass
 
 
 async def _watch_price_ruling_loop(
@@ -151,7 +149,6 @@ async def _watch_price_ruling_loop(
 
 
 async def _run(bot_id: str, trigger: Decimal, size: Decimal, min_window_secs: int) -> None:
-    from src.exchanges.market_resolver import resolve_all_outcomes
     from src.feeds.clob_feed import ClobPriceFeed
     from src.infra.activity_logger import ActivityLogger
     from src.manager.config import load_roster
@@ -172,8 +169,8 @@ async def _run(bot_id: str, trigger: Decimal, size: Decimal, min_window_secs: in
             click.echo(f"ERROR: bot {bot_id!r} not found.", err=True)
             sys.exit(1)
 
-        resolved, up_label, up_token, dn_label, dn_token, window_end = (
-            await _resolve_next_window(entry, min_window_secs)
+        resolved, up_label, up_token, dn_label, dn_token, window_end = await _resolve_next_window(
+            entry, min_window_secs
         )
         if not up_token or not dn_token:
             click.echo(f"ERROR: unexpected outcomes {list(resolved.tokens.keys())}")
@@ -290,10 +287,8 @@ async def _run(bot_id: str, trigger: Decimal, size: Decimal, min_window_secs: in
         finally:
             stop_price_poll.set()
             price_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await price_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
         if not fired:
             click.echo(f"\n[{_ts()}] Window closed -- no trigger fired. Exiting.")

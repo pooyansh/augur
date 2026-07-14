@@ -143,11 +143,11 @@ async def _run(bot_id: str) -> None:
         # Build a per-bot SignalsRuntime so on_tick receives real signal data.
         if entry.signals:
             import httpx
+            from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
             from src.signals.registry import signals as signal_registry
             from src.signals.runner import SignalsRuntime
             from src.signals.storage import SignalStorage
-            from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
             signal_registry.autodiscover()
             sf: async_sessionmaker[AsyncSession] = session_factory  # type: ignore[assignment]
@@ -162,7 +162,9 @@ async def _run(bot_id: str) -> None:
             for sub in entry.signals:
                 signals_runtime.subscribe(sub.name, dict(sub.params))
             await signals_runtime.start()
-            logger.info("SignalsRuntime started for bot %s (%d signal(s)).", bot_id, len(entry.signals))
+            logger.info(
+                "SignalsRuntime started for bot %s (%d signal(s)).", bot_id, len(entry.signals)
+            )
     else:
         # Offline / test path — use in-memory stubs.
         logger.warning("POSTGRES_HOST not set — using in-memory state stubs (no persistence).")
