@@ -17,6 +17,7 @@ Tests:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import signal
 import tempfile
@@ -361,6 +362,104 @@ async def test_drain_sends_sigterm_to_all_bots(short_tmp: Path) -> None:
 
     # After drain, the running dict must be empty.
     assert supervisor._running == {}
+
+
+# ---------------------------------------------------------------------------
+# Test 6: stop_bot — on-demand single-bot stop
+# ---------------------------------------------------------------------------
+
+
+class SlowFakeProcess(FakeProcess):
+    """Ignores SIGTERM; only exits on SIGKILL.
+
+    Used to exercise the SIGKILL fallback path in ``stop_bot``.
+    """
+
+    def __init__(self, pid: int = 1) -> None:
+        super().__init__(pid=pid)
+        self._kill_event = asyncio.Event()
+
+    def send_signal(self, sig: int) -> None:
+        self._signals_received.append(sig)
+        if sig == signal.SIGKILL:
+            self.returncode = 0
+            self._kill_event.set()
+
+    async def wait(self) -> int:
+        await self._kill_event.wait()
+        return self.returncode or 0
+
+
+@pytest.mark.asyncio
+async def test_stop_bot_running_stops_within_grace(short_tmp: Path) -> None:
+    """A running bot receives SIGTERM, exits cleanly, and is removed."""
+    calls, fake_spawn = _make_fake_spawn()
+    deps = _make_deps(spawn=fake_spawn)
+
+    roster = _roster(_entry("bot-s"))
+    supervisor = Supervisor(
+        roster=roster,
+        sock_dir=short_tmp / "s",
+        live_allowlist=set(),
+        deps=deps,
+    )
+    await supervisor.start()
+    assert len(calls) == 1
+    proc = supervisor._running["bot-s"].proc
+
+    stopped = await supervisor.stop_bot("bot-s", grace_s=1.0)
+
+    assert stopped is True
+    assert signal.SIGTERM in proc._signals_received  # type: ignore[attr-defined]
+    assert signal.SIGKILL not in proc._signals_received  # type: ignore[attr-defined]
+    assert "bot-s" not in supervisor._running
+
+    await supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_bot_not_running_returns_false(short_tmp: Path) -> None:
+    """Stopping a bot id that isn't running is a no-op, not an error."""
+    deps = _make_deps()
+    roster = _roster(_entry("bot-q"))
+    supervisor = Supervisor(
+        roster=roster,
+        sock_dir=short_tmp / "s",
+        live_allowlist=set(),
+        deps=deps,
+    )
+
+    stopped = await supervisor.stop_bot("bot-never-spawned")
+
+    assert stopped is False
+
+
+@pytest.mark.asyncio
+async def test_stop_bot_sigkill_fallback_when_grace_expires(short_tmp: Path) -> None:
+    """If the process ignores SIGTERM past grace_s, SIGKILL is sent."""
+    proc = SlowFakeProcess(pid=99)
+
+    async def _spawn(entry: BotEntry, env: dict[str, str]) -> SlowFakeProcess:
+        return proc
+
+    deps = _make_deps(spawn=_spawn)
+    roster = _roster(_entry("bot-z"))
+    supervisor = Supervisor(
+        roster=roster,
+        sock_dir=short_tmp / "s",
+        live_allowlist=set(),
+        deps=deps,
+    )
+    await supervisor.start()
+
+    stopped = await supervisor.stop_bot("bot-z", grace_s=0.05)
+
+    assert stopped is True
+    assert signal.SIGTERM in proc._signals_received
+    assert signal.SIGKILL in proc._signals_received
+    assert "bot-z" not in supervisor._running
+
+    await supervisor.stop()
 
 
 # ---------------------------------------------------------------------------

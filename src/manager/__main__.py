@@ -266,6 +266,7 @@ def start(
                 redactor=redactor,
                 supervisor=supervisor,
                 health_checker=health_checker,
+                audit=audit,
             )
             await dashboard_server.start(host=dashboard_host, port=dashboard_port)
 

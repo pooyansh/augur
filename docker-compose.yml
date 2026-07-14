@@ -35,6 +35,16 @@ services:
         source: ./secrets
         target: /app/secrets
         read_only: true
+    ports:
+      # Operator dashboard — loopback-only, per .claude/rules/06b-dashboard.md
+      # invariant 4. Reach it via `ssh -L 8090:127.0.0.1:8090 user@vps`.
+      - "127.0.0.1:8090:8090"
+    environment:
+      # dashboard_reader read-only Postgres role credentials (invariant 8 in
+      # .claude/rules/06b-dashboard.md). Falls back to write-role creds with a
+      # warning log if unset.
+      DASHBOARD_PG_USER: ${DASHBOARD_PG_USER:-}
+      DASHBOARD_PG_PASSWORD: ${DASHBOARD_PG_PASSWORD:-}
     env_file:
       - .env
     depends_on:
