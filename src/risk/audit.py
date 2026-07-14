@@ -35,6 +35,7 @@ __all__ = [
     "KIND_ORDER_REJECTED",
     "KIND_ORDER_RESULT",
     "KIND_ORDER_SUBMITTED",
+    "KIND_PROVISIONAL_RULING",
     "KIND_RISK_CAP_EXCEEDED",
     "KIND_TRIGGER_FIRED",
     "KIND_TRIGGER_MISSED",
@@ -104,6 +105,14 @@ KIND_RISK_CAP_EXCEEDED = "risk_cap_exceeded"
 # Feed / market lifecycle
 KIND_MARKET_RESOLVED = "market_resolved"
 KIND_MARKET_SETTLED = "market_settled"
+
+# Provisional (heuristic, early) winning-rule ruling — see
+# .claude/rules/10-winning-rules.md.  Explicitly NON-AUTHORITATIVE: this kind
+# must never be read by P&L bookkeeping, perf_rollup aggregation, or any
+# consumer that expects real settlement. It exists solely to inform a
+# strategy's own continuation decision (e.g. stop placing further orders).
+KIND_PROVISIONAL_RULING = "provisional_ruling"
+
 KIND_FEED_STARTED = "feed_started"
 KIND_FEED_RECONNECTED = "feed_reconnected"
 KIND_FEED_ERROR = "feed_error"

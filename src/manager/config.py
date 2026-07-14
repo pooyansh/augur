@@ -16,6 +16,7 @@ __all__ = [
     "RiskOverride",
     "SecretRef",
     "SignalSubscription",
+    "WinningRuleRef",
     "load_roster",
 ]
 
@@ -90,6 +91,24 @@ class SignalSubscription(BaseModel):
     Args:
         name: Registry key of the signal (e.g. ``"btc_usd_price"``).
         params: Optional feed-specific parameters (e.g. window size).
+    """
+
+    name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class WinningRuleRef(BaseModel):
+    """Optional reference to a provisional winning rule for a bot instance.
+
+    See ``.claude/rules/10-winning-rules.md``.  A provisional ruling only
+    informs a strategy's own continuation decision (e.g. skip placing further
+    orders this window) — it never feeds P&L accounting or real settlement.
+
+    Args:
+        name: Fully-qualified dotted registry key, e.g.
+            ``"polymarket.btc_up_or_down_5m.price_compare"``. Always includes
+            the ``<venue>.<series_slug>.`` prefix — never a bare short name.
+        params: Optional rule-specific parameters (e.g. a tolerance threshold).
     """
 
     name: str
@@ -190,6 +209,9 @@ class BotEntry(BaseModel):
             Setting ``"live"`` here is one of the three locks (invariant 1).
         schedule: Tick schedule string, e.g. ``"every:60s"``.
         signals: Signal subscriptions declared by this bot.
+        winning_rule: Optional provisional winning rule reference. Absent by
+            default — most bots never configure one; it's a strategy-author
+            opt-in, not new mandatory infrastructure.
         risk: Risk cap overrides (mandatory).
         secrets: Symbolic references to secrets (never plaintext).
         alerts: Optional per-bot alerting route overrides.
@@ -201,6 +223,7 @@ class BotEntry(BaseModel):
     mode: Literal["paper", "live"] = "paper"
     schedule: str
     signals: list[SignalSubscription] = Field(default_factory=list)
+    winning_rule: WinningRuleRef | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskOverride
     secrets: SecretRef

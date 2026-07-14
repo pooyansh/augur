@@ -19,10 +19,18 @@ class MyStrategy(BaseBot):
 
 That is the complete public surface of a strategy.  Nothing else.
 
+**Additive note (Phase — provisional winning rules):** `current_position(self)
+-> PositionState | None` is a new *optional* override, default returns
+`None`, that joins the three required methods above only for strategies that
+opt into the provisional-winning-rule feature (`.claude/rules/10-winning-rules.md`).
+It does not change the "complete public surface" claim's spirit — it's an
+opt-in provided/overridable helper, not a new required method, and a
+strategy that never overrides it is unaffected.
+
 ## What strategies MUST NOT do
 
-- Override `run`, `place`, `_next_client_order_id`, `_check_risk_caps`, or
-  `_persist_snapshot`.
+- Override `run`, `place`, `_next_client_order_id`, `_check_risk_caps`,
+  `_persist_snapshot`, or `provisional_ruling`.
 - Call `self._deps.adapter.place()` directly — always go through `self.place()`.
 - Generate or fabricate `client_order_id` values — use `OrderTemplate`, not
   `OrderIntent`, when returning from `on_tick`.
@@ -93,4 +101,6 @@ The interface (`Heartbeat.beat()`) is unchanged across versions.
 
 - `.claude/rules/02-state-handoff.md` — snapshot schema, rehydrate semantics,
   strategy-to-strategy handoff.
+- `.claude/rules/10-winning-rules.md` — optional provisional winning rules
+  (`current_position`, `provisional_ruling`).
 - `src/bots/base.py` — authoritative implementation.

@@ -77,6 +77,49 @@ def validate_bot_signals(entry: BotEntry) -> None:
         )
 
 
+def validate_bot_winning_rule(entry: BotEntry) -> None:
+    """Validate a bot entry's optional provisional winning rule reference.
+
+    Called before spawning a bot subprocess, mirroring
+    :func:`validate_bot_signals`. If ``entry.winning_rule`` is unset this is
+    a no-op — the feature is opt-in. If set, the dotted name must be
+    registered, and its ``<venue>`` prefix must match ``entry.market.exchange``
+    (catches a copy-paste config mistake, e.g. a BTC bot referencing an
+    ETH-series rule).
+
+    Args:
+        entry: The bot roster entry whose ``winning_rule`` (if any) will be
+            checked.
+
+    Raises:
+        ValueError: If the rule name is not registered, or if its venue
+            prefix doesn't match ``entry.market.exchange``.
+    """
+    if entry.winning_rule is None:
+        return
+
+    from src.rules.registry import rules as rule_registry
+
+    name = entry.winning_rule.name
+    try:
+        rule_registry.get(name)
+    except KeyError:
+        available = rule_registry.names
+        raise ValueError(
+            f"Bot '{entry.id}' declares unknown winning rule {name!r}. "
+            f"Registered winning rules: {available}. "
+            "Register the rule or remove it from the bot's config."
+        ) from None
+
+    venue = name.split(".", 1)[0]
+    if venue != entry.market.exchange:
+        raise ValueError(
+            f"Bot '{entry.id}' references winning rule {name!r} (venue={venue!r}) "
+            f"but trades on exchange={entry.market.exchange!r}. "
+            "The winning rule's venue prefix must match the bot's market exchange."
+        )
+
+
 logger = logging.getLogger(__name__)
 
 # Watchdog tick interval in seconds.
@@ -421,6 +464,8 @@ class Supervisor:
         # Validate signal subscriptions before doing anything else.
         # Unknown signals fail fast with a clear error (invariant: fail-closed).
         validate_bot_signals(entry)
+        # Validate the optional provisional winning rule reference, if any.
+        validate_bot_winning_rule(entry)
 
         env = self._build_env(entry)
         mode_override: str | None = None

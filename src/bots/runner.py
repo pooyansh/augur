@@ -190,6 +190,25 @@ async def _run(bot_id: str) -> None:
     adapter = make_adapter(entry.market.exchange, mode)
 
     # ------------------------------------------------------------------
+    # Resolve the optional provisional winning rule (opt-in; absent for most
+    # bots). Validated already at supervisor spawn time — resolve again here
+    # defensively since the subprocess doesn't share supervisor state.
+    # ------------------------------------------------------------------
+    winning_rule_instance = None
+    winning_rule_params: dict[str, object] = {}
+    if entry.winning_rule is not None:
+        from src.rules.registry import rules as rule_registry
+
+        rule_registry.autodiscover()
+        try:
+            rule_class = rule_registry.get(entry.winning_rule.name)
+            winning_rule_instance = rule_class()
+            winning_rule_params = dict(entry.winning_rule.params)
+        except KeyError as exc:
+            logger.critical("Winning rule not found for bot %s: %s", bot_id, exc)
+            sys.exit(2)
+
+    # ------------------------------------------------------------------
     # Build BotConfig
     # ------------------------------------------------------------------
     risk_override = entry.risk
@@ -207,6 +226,8 @@ async def _run(bot_id: str) -> None:
         ),
         signal_subscriptions=[s.name for s in entry.signals],
         strategy_params=entry.params,
+        winning_rule=winning_rule_instance,
+        winning_rule_params=winning_rule_params,
     )
 
     # ------------------------------------------------------------------
@@ -247,6 +268,8 @@ async def _run(bot_id: str) -> None:
             risk=bot_config.risk,
             signal_subscriptions=bot_config.signal_subscriptions,
             strategy_params=bot_config.strategy_params,
+            winning_rule=bot_config.winning_rule,
+            winning_rule_params=bot_config.winning_rule_params,
         )
     else:
         market = None  # resolved inside adapter context below

@@ -278,3 +278,51 @@ def test_invalid_mode_rejected() -> None:
     data = _make_roster([_make_entry(mode="sandbox")])
     with pytest.raises(ValidationError):
         BotsRoster.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# winning_rule (WinningRuleRef) validation
+# ---------------------------------------------------------------------------
+
+
+def test_winning_rule_absent_by_default() -> None:
+    """Omitting winning_rule defaults to None — the feature is opt-in."""
+    roster = BotsRoster.model_validate(_make_roster([_make_entry()]))
+    assert roster.bots[0].winning_rule is None
+
+
+def test_winning_rule_valid_when_present() -> None:
+    """A valid winning_rule block parses with name and params."""
+    data = _make_roster(
+        [
+            _make_entry(
+                winning_rule={
+                    "name": "polymarket.btc_up_or_down_5m.price_compare",
+                    "params": {"tolerance_pct": "0.05"},
+                }
+            )
+        ]
+    )
+    roster = BotsRoster.model_validate(data)
+    ref = roster.bots[0].winning_rule
+    assert ref is not None
+    assert ref.name == "polymarket.btc_up_or_down_5m.price_compare"
+    assert ref.params == {"tolerance_pct": "0.05"}
+
+
+def test_winning_rule_params_default_to_empty_dict() -> None:
+    """Omitting params on winning_rule defaults to an empty dict."""
+    data = _make_roster(
+        [_make_entry(winning_rule={"name": "polymarket.btc_up_or_down_5m.price_compare"})]
+    )
+    roster = BotsRoster.model_validate(data)
+    ref = roster.bots[0].winning_rule
+    assert ref is not None
+    assert ref.params == {}
+
+
+def test_winning_rule_missing_name_rejected() -> None:
+    """A winning_rule block without a name fails validation."""
+    data = _make_roster([_make_entry(winning_rule={"params": {}})])
+    with pytest.raises(ValidationError):
+        BotsRoster.model_validate(data)
