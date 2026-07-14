@@ -19,6 +19,8 @@ __all__ = [
     "Heartbeat",
     "KillSwitchTripped",
     "LocalHeartbeat",
+    "PositionState",
+    "ProvisionalRuling",
     "RiskCapExceeded",
     "RiskCaps",
     "Schedule",
@@ -45,9 +47,10 @@ from src.exchanges.base import (
     OrderResult,
     OrderTemplate,
 )
-from src.risk.audit import AuditLogger
+from src.risk.audit import KIND_PROVISIONAL_RULING, AuditLogger
 from src.risk.caps import RiskCapExceeded, RiskCaps, check_caps
 from src.risk.kill_switch import KillSwitchCascade, KillSwitchReader
+from src.rules.base import PositionState, ProvisionalRuling, WinningRule, WinningRuleContext
 from src.signals.base import SignalSnapshot
 from src.state.repository import StateRepository
 
@@ -192,6 +195,12 @@ class BotConfig:
         signal_subscriptions: List of signal names the bot subscribes to.
             The signals runner (Phase 3a) uses this to pre-fetch only the
             required feeds.
+        winning_rule: Optional resolved :class:`~src.rules.base.WinningRule`
+            instance (looked up from ``BotEntry.winning_rule.name`` and
+            instantiated by the bot runner). ``None`` for the vast majority
+            of bots that don't opt into the provisional-ruling feature.
+        winning_rule_params: Params passed through to ``winning_rule.evaluate``
+            each time it's invoked (from ``BotEntry.winning_rule.params``).
     """
 
     bot_id: str
@@ -203,6 +212,8 @@ class BotConfig:
     risk: RiskCaps
     signal_subscriptions: list[str]
     strategy_params: dict[str, Any] = field(default_factory=dict)
+    winning_rule: WinningRule | None = None
+    winning_rule_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -330,6 +341,13 @@ class BaseBot(ABC):
             bot_id=config.bot_id,
         )
 
+        # Optional provisional winning rule (opt-in; see
+        # .claude/rules/10-winning-rules.md). Resolved by the bot runner from
+        # config and threaded through here unchanged — BaseBot never looks
+        # rules up itself.
+        self._winning_rule: WinningRule | None = config.winning_rule
+        self._provisional_ruling_cache: ProvisionalRuling | None = None
+
         if deps.signals is None:
             from src.signals.base import InMemorySignals
 
@@ -385,8 +403,46 @@ class BaseBot(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Optional override — default is inert, existing strategies need zero
+    # changes.  Only relevant to strategies that opt into the provisional
+    # winning-rule feature (see .claude/rules/10-winning-rules.md).
+    # ------------------------------------------------------------------
+
+    def current_position(self) -> PositionState | None:
+        """Expose the strategy's currently-held position, if any.
+
+        Strategies that want ``provisional_ruling()`` to compute anything
+        implement this to report their already-tracked position (e.g. side,
+        entry reference, size). The default returns ``None`` — safe and
+        inert — so a strategy that never overrides this always gets
+        ``provisional_ruling() is None`` and zero behavior change.
+
+        Returns:
+            The current :class:`~src.rules.base.PositionState`, or ``None``
+            if no position is held (or the strategy hasn't opted in).
+        """
+        return None
+
+    # ------------------------------------------------------------------
     # Provided — DO NOT override
     # ------------------------------------------------------------------
+
+    def provisional_ruling(self) -> ProvisionalRuling | None:
+        """Return the most recently computed provisional ruling, if any.
+
+        Computed once per tick inside ``run()``, before ``on_tick`` is
+        called, whenever a ``WinningRule`` is configured AND
+        ``current_position()`` returns a position. Purely informational —
+        never triggers action on its own; a strategy consults this from
+        inside its own ``on_tick`` and decides what to do.
+
+        Returns:
+            The cached :class:`~src.rules.base.ProvisionalRuling`, or
+            ``None`` if no rule is configured, no position is held, or the
+            most recent evaluation raised (degrades to ``None`` rather than
+            serving a stale ruling).
+        """
+        return self._provisional_ruling_cache
 
     async def run(self) -> None:
         """Main bot loop.  Ticks on the configured schedule until cancelled.
@@ -395,6 +451,9 @@ class BaseBot(ABC):
         1. Fetch signals snapshot.
         2. Beat heartbeat.
         3. Check kill switch — if tripped, cancel-all and skip ``on_tick``.
+        3b. If a provisional winning rule is configured and the strategy
+            reports a current position, evaluate it (purely informational;
+            see .claude/rules/10-winning-rules.md).
         4. Call ``on_tick``.
         5. Process cancels from the decision.
         6. Process order intents via ``place()``.
@@ -446,6 +505,11 @@ class BaseBot(ABC):
                 else:
                     # Switch is clear — reset cascade so next trip re-issues cancel_all.
                     self._ks_cascade.reset()
+
+                # 3b. Provisional winning rule (optional, opt-in, purely informational —
+                # never feeds P&L/position/real settlement; see
+                # .claude/rules/10-winning-rules.md).
+                await self._evaluate_winning_rule(signals)
 
                 # 4. Strategy tick — measure latency
                 on_tick_start = time.perf_counter()
@@ -650,6 +714,63 @@ class BaseBot(ABC):
     # ------------------------------------------------------------------
     # Internal helpers — strategies must not call these directly
     # ------------------------------------------------------------------
+
+    async def _evaluate_winning_rule(self, signals: SignalSnapshot) -> None:
+        """Evaluate the configured provisional winning rule, if any, for this tick.
+
+        Called from ``run()`` between the kill-switch check and ``on_tick``.
+        Updates ``self._provisional_ruling_cache`` and writes a
+        ``KIND_PROVISIONAL_RULING`` audit row only when the ruling *changes*
+        from the previous tick — this avoids flooding ``audit_log`` every
+        tick while still capturing every transition.
+
+        No-op (cache stays/reverts to ``None``) when no rule is configured or
+        ``current_position()`` returns ``None``. A rule that raises never
+        propagates — the tick continues and the cached ruling degrades to
+        ``None`` rather than serving a stale value.
+
+        Args:
+            signals: The same ``SignalSnapshot`` already fetched this tick.
+        """
+        if self._winning_rule is None:
+            self._provisional_ruling_cache = None
+            return
+
+        position = self.current_position()
+        if position is None:
+            self._provisional_ruling_cache = None
+            return
+
+        try:
+            ruling = self._winning_rule.evaluate(
+                WinningRuleContext(
+                    position=position,
+                    signals=signals,
+                    now=self._deps.clock.now(),
+                    params=self._config.winning_rule_params,
+                )
+            )
+            if ruling != self._provisional_ruling_cache:
+                await self._deps.audit.write(
+                    bot_id=self._config.bot_id,
+                    kind=KIND_PROVISIONAL_RULING,
+                    payload={
+                        "rule_name": self._winning_rule.name,
+                        "ruling": ruling.value,
+                        "position_side": position.side,
+                        "entry_reference": str(position.entry_reference),
+                        "market_id": position.market_id,
+                    },
+                )
+            self._provisional_ruling_cache = ruling
+        except Exception as exc:
+            logger.error(
+                "Winning rule '%s' evaluation failed for bot %s: %s",
+                getattr(self._winning_rule, "name", "?"),
+                self._config.bot_id,
+                exc,
+            )
+            self._provisional_ruling_cache = None
 
     def _next_client_order_id(self) -> str:
         """Generate the next deterministic ``client_order_id``.
