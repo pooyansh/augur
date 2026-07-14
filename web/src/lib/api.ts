@@ -201,3 +201,26 @@ export const api = {
   failures: () => fetchApi<FailuresResponse>("/api/failures"),
   capital: () => fetchApi<CapitalResponse>("/api/capital"),
 };
+
+// ---------------------------------------------------------------------------
+// Control API — write-capable calls, kept structurally distinct from the
+// read-only `api` object above. `/api/control/*` is a separate, narrow
+// surface (see .claude/rules/06b-dashboard.md) that performs process control
+// actions, not database writes.
+// ---------------------------------------------------------------------------
+
+export interface StopBotResponse {
+  bot_id: string;
+  stopped: boolean;
+}
+
+export const controlApi = {
+  stopBot: async (botId: string): Promise<StopBotResponse> => {
+    const url = `${BASE}/api/control/bots/${encodeURIComponent(botId)}/stop`;
+    const resp = await fetch(url, { method: "POST" });
+    if (!resp.ok) {
+      throw new Error(`API /api/control/bots/${botId}/stop returned ${resp.status}`);
+    }
+    return (await resp.json()) as StopBotResponse;
+  },
+};

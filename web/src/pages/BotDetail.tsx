@@ -1,9 +1,15 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "react-router-dom";
-import { api } from "../lib/api.ts";
+import { api, controlApi } from "../lib/api.ts";
 
 export default function BotDetail() {
   const { botId } = useParams<{ botId: string }>();
+  const queryClient = useQueryClient();
+  const [stopMessage, setStopMessage] = useState<{
+    kind: "stopped" | "not_running" | "error";
+    text: string;
+  } | null>(null);
 
   const botQ = useQuery({
     queryKey: ["bot", botId],
@@ -11,6 +17,39 @@ export default function BotDetail() {
     enabled: !!botId,
     refetchInterval: 60_000,
   });
+
+  const stopMutation = useMutation({
+    mutationFn: () => controlApi.stopBot(botId!),
+    onSuccess: (data) => {
+      if (data.stopped) {
+        setStopMessage({ kind: "stopped", text: `Bot ${data.bot_id} stopped.` });
+        void queryClient.invalidateQueries({ queryKey: ["bot", botId] });
+        void queryClient.invalidateQueries({ queryKey: ["bots"] });
+        void queryClient.invalidateQueries({ queryKey: ["status"] });
+      } else {
+        setStopMessage({
+          kind: "not_running",
+          text: `Bot ${data.bot_id} was not running.`,
+        });
+      }
+    },
+    onError: (error) => {
+      setStopMessage({
+        kind: "error",
+        text: error instanceof Error ? error.message : "Failed to stop bot.",
+      });
+    },
+  });
+
+  const handleStopClick = () => {
+    if (!botId) return;
+    const confirmed = window.confirm(
+      `Stop bot "${botId}"? This will terminate the running process.`,
+    );
+    if (!confirmed) return;
+    setStopMessage(null);
+    stopMutation.mutate();
+  };
 
   if (botQ.isLoading) return <p className="text-gray-500">Loading...</p>;
   if (botQ.isError) {
@@ -44,7 +83,28 @@ export default function BotDetail() {
         >
           {bot.mode}
         </span>
+        <button
+          onClick={handleStopClick}
+          disabled={stopMutation.isPending}
+          className="ml-auto bg-red-900 hover:bg-red-800 disabled:opacity-50 disabled:cursor-not-allowed text-red-100 text-sm px-3 py-1.5 rounded"
+        >
+          {stopMutation.isPending ? "Stopping..." : "Stop bot"}
+        </button>
       </div>
+
+      {stopMessage && (
+        <p
+          className={`text-sm ${
+            stopMessage.kind === "stopped"
+              ? "text-green-400"
+              : stopMessage.kind === "not_running"
+                ? "text-amber-400"
+                : "text-red-400"
+          }`}
+        >
+          {stopMessage.text}
+        </p>
+      )}
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
         <div className="bg-gray-800 rounded p-3">
