@@ -40,6 +40,12 @@ from typing import Any, ClassVar
 
 import httpx
 from pydantic import BaseModel
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.exchanges.base import (
     CancelEvent,
@@ -61,6 +67,40 @@ logger = logging.getLogger(__name__)
 # Polygon mainnet contract addresses (public, not secrets)
 _USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon
 _CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Polymarket CTF Exchange
+
+# Default public RPC — known to rate-limit/reject unauthenticated bot traffic.
+# See .claude/rules/05-exchanges.md § Wallet safety checks for the documented gap.
+_DEFAULT_PUBLIC_RPC_URL = "https://polygon-rpc.com"
+
+# Retry policy for _rpc_eth_call: a small number of short-backoff attempts so
+# a real authenticated provider's occasional transient hiccup doesn't
+# immediately trip the (intentional) fail-open path in _startup_wallet_checks.
+_RPC_RETRY_ATTEMPTS = 3
+_RPC_RETRY_WAIT_INITIAL_SECONDS = 0.5
+_RPC_RETRY_WAIT_MAX_SECONDS = 4.0
+
+# HTTP status codes worth retrying on an RPC call — transient server/rate-limit
+# conditions.  401/403 are deliberately excluded: they mean the RPC URL/auth is
+# wrong, not that the request was transient, so retrying wastes time before the
+# fail-open path (correctly) kicks in.
+_RPC_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable_rpc_exception(exc: BaseException) -> bool:
+    """Return whether an exception from an RPC call is worth retrying.
+
+    Args:
+        exc: Exception raised by the RPC HTTP call.
+
+    Returns:
+        ``True`` for network errors, timeouts, and retryable HTTP status
+        codes (429/5xx).  ``False`` for everything else, notably 401/403
+        auth failures.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RPC_RETRYABLE_STATUS_CODES
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+
 
 # ---------------------------------------------------------------------------
 # Config model
@@ -165,6 +205,21 @@ class PolymarketAdapter(ExchangeAdapter):
         )
 
         if self._mode == Mode.LIVE:
+            if self._config.polygon_rpc_url == _DEFAULT_PUBLIC_RPC_URL:
+                logger.warning(
+                    "polymarket_default_public_rpc_in_live_mode",
+                    extra={
+                        "message": (
+                            "wallet safety checks are using the default public Polygon "
+                            "RPC (polygon-rpc.com), which is known to rate-limit/reject "
+                            "bot traffic — set polymarket.polygon_rpc_url in "
+                            "secrets/exchanges.enc.yaml to an authenticated provider "
+                            "(Alchemy/Infura/Ankr all have free tiers) for reliable "
+                            "pre-trade safety checks."
+                        ),
+                    },
+                )
+
             # Auto-detect CLOB account version and select signing mode.
             # Version 2 accounts use the POLY_1271 deposit wallet flow.
             sig_type, dw_addr = await self._resolve_signing_mode()
@@ -235,8 +290,26 @@ class PolymarketAdapter(ExchangeAdapter):
     # Startup checks (live mode only)
     # ------------------------------------------------------------------
 
+    @retry(
+        retry=retry_if_exception(_is_retryable_rpc_exception),
+        stop=stop_after_attempt(_RPC_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=_RPC_RETRY_WAIT_INITIAL_SECONDS,
+            min=_RPC_RETRY_WAIT_INITIAL_SECONDS,
+            max=_RPC_RETRY_WAIT_MAX_SECONDS,
+        ),
+        reraise=True,
+    )
     async def _rpc_eth_call(self, rpc_url: str, to: str, data: str) -> str:
-        """Issue a JSON-RPC eth_call and return the raw hex result string."""
+        """Issue a JSON-RPC eth_call and return the raw hex result string.
+
+        Retries a small number of times with exponential backoff on transient
+        failures (network errors, timeouts, HTTP 429/5xx).  Does NOT retry on
+        401/403 — those indicate a bad RPC URL/auth, not a transient failure,
+        and retrying would only delay the caller's (intentional) fail-open
+        handling in :meth:`_startup_wallet_checks`.
+        """
+        assert self._http is not None
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -245,7 +318,7 @@ class PolymarketAdapter(ExchangeAdapter):
         }
         resp = await self._http.post(rpc_url, json=payload, timeout=10.0)
         resp.raise_for_status()
-        return resp.json()["result"]
+        return str(resp.json()["result"])
 
     async def _rpc_erc20_uint256(
         self, rpc_url: str, contract: str, selector_hex: str, *addr_args: str

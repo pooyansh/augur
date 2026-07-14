@@ -90,14 +90,24 @@ SELL: makerAmount = round(size * 1_000_000)            # shares the maker spends
 ### `client_order_id → salt` mapping (Option B — deterministic)
 
 ```python
-salt = int.from_bytes(bytes.fromhex(client_order_id[:16]), 'big')
+salt = int.from_bytes(bytes.fromhex(client_order_id[:10]), 'big')
 ```
 
-Take the first 16 hex characters (8 bytes) of the `client_order_id` and
-interpret as a big-endian integer.  This is stateless and survives restarts —
-retrying the same `client_order_id` reconstructs the identical signed payload.
+Take the first **10** hex characters (**5 bytes**) of the `client_order_id`
+and interpret as a big-endian integer.  This is stateless and survives
+restarts — retrying the same `client_order_id` reconstructs the identical
+signed payload.
 
-Implemented in `src/exchanges/polymarket_signing.py::derive_salt`.
+5 bytes is a deliberate choice, not an oversight: it caps the salt at
+`2^40` (~1.1e12), safely within JavaScript's `MAX_SAFE_INTEGER` (`2^53 - 1`).
+The CLOB parses `salt` as a JSON number, and salts exceeding
+`MAX_SAFE_INTEGER` lose precision in JavaScript, causing signature
+verification failures. (An earlier draft of this doc said 16 hex chars /
+8 bytes, which would exceed that bound — that was a doc error, not what
+ships.)
+
+Implemented and live-verified in
+`src/exchanges/polymarket_signing.py::derive_salt`.
 
 ### Cancel surface (4 methods)
 
@@ -208,19 +218,80 @@ datetime.fromisoformat(s.replace(" ", "T"))
 
 ### Wallet safety checks (live mode only)
 
-Enforced in `__aenter__` / startup:
+Enforced in `__aenter__` / startup, implemented in
+`PolymarketAdapter._startup_wallet_checks()`. **These are fully implemented,
+not stubbed** — an earlier version of this doc described them as "STUBBED
+pending Phase 4 wallet integration"; that is stale.
 
-1. **On-chain USDC allowance check** — STUBBED pending Phase 4 wallet integration.
-   Requires RPC call to Polygon to read `allowance(wallet, ctf_exchange_contract)`.
-   If > `config.max_allowance_usdc`, refuse to start and emit critical alert.
+1. **Signature type consistency** — pure, no RPC call. Verifies
+   `config.signature_type == 3` (POLY_1271) always has a
+   `deposit_wallet_address` set; raises `RuntimeError` if not.
 
-2. **Hot-wallet balance ceiling** — STUBBED. Requires Polygon RPC balance check.
-   If balance > `config.balance_ceiling_usdc`, alert at warn.
+2. **On-chain USDC allowance check** — `eth_call` against USDC.e
+   (`allowance(address,address)`, selector `0xdd62ed3e`) with args
+   `(wallet_address, ctf_exchange_contract)`, via `config.polygon_rpc_url`.
+   If the decoded allowance exceeds `config.max_allowance_usdc`, startup is
+   refused (`RuntimeError`).
 
-3. **Signature type verification** — STUBBED. Verify `config.signature_type`
-   matches the actual wallet shape (EOA=0, proxy=1, gnosis=2).
+3. **Hot-wallet balance ceiling** — `eth_call` against USDC.e
+   (`balanceOf(address)`, selector `0x70a08231`) with arg `wallet_address`,
+   via `config.polygon_rpc_url`. If the decoded balance exceeds
+   `config.balance_ceiling_usdc`, logs a `warning` — does **not** block
+   startup.
 
-These stubs are in `PolymarketAdapter._startup_wallet_checks()`.
+Both RPC-backed checks (2 and 3) go through `PolymarketAdapter._rpc_eth_call`,
+which is retried (see below) before either check's own try/except
+fail-open handling applies.
+
+#### Known gap: default RPC is an unauthenticated public endpoint
+
+`PolymarketConfig.polygon_rpc_url` defaults to `https://polygon-rpc.com` — a
+free, public, unauthenticated Polygon RPC. In practice it periodically
+returns `HTTP 401 Unauthorized` under bot traffic (rate-limiting/blocking),
+which trips the fail-open path below (allowance/balance checks silently
+degrade to "unknown"). **This is a live-verified, recurring issue, not a
+hypothetical.**
+
+**Fix:** set `polymarket.polygon_rpc_url` in `secrets/exchanges.enc.yaml` to
+an authenticated RPC provider URL — e.g. Alchemy, Infura, or Ankr (all have
+free tiers; named as examples, not an endorsement of any one). No schema
+change is required — `polygon_rpc_url` is already a plain config field that
+secrets can override.
+
+On `__aenter__` in live mode, if `polygon_rpc_url` is still the default
+public value, the adapter logs a `warning`
+(`polymarket_default_public_rpc_in_live_mode`) making the gap and the fix
+explicit in the logs, rather than leaving it as a silent per-call warning
+with no root cause pointer.
+
+#### Retry behavior on `_rpc_eth_call`
+
+To tolerate a real authenticated provider's occasional transient hiccup
+without immediately falling through to the fail-open path, `_rpc_eth_call`
+retries via `tenacity`:
+
+- Up to **3 attempts** total (2 retries), exponential backoff starting at
+  **~0.5s**, capped at 4s.
+- Retries on: network errors, timeouts, and HTTP `429`/`500`/`502`/`503`/`504`.
+- **Does NOT retry on `401`/`403`** — those mean the RPC URL/auth is wrong,
+  not a transient condition; retrying wastes time before the (correct)
+  fail-open handling kicks in.
+
+#### Fail-open is an intentional design decision, not a gap
+
+If either RPC-backed check exhausts its retries and still fails (for any
+reason — 401, network partition, provider outage), `_startup_wallet_checks()`
+catches the exception, logs `warning`
+(`polymarket_allowance_check_failed` / `polymarket_balance_check_failed`),
+and **startup proceeds**. This is deliberate: a flaky or unreachable RPC must
+never block legitimate live trading, since the wallet safety checks are a
+best-effort pre-trade safety net layered on top of the hard risk controls in
+`.claude/rules/06-risk-controls.md` (kill switch, position/loss caps) — not a
+hard gate in their own right. The tradeoff is explicit: these checks can be
+silently degraded by RPC unavailability, and operators should watch for the
+`polymarket_default_public_rpc_in_live_mode` /
+`polymarket_allowance_check_failed` / `polymarket_balance_check_failed` log
+events as the signal that the safety net isn't currently active.
 
 ### Reconciliation
 

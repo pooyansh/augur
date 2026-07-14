@@ -100,8 +100,10 @@ async def test_balance_over_ceiling_warns_not_raises(caplog: pytest.LogCaptureFi
         with patch.object(adapter, "_rpc_eth_call", new=AsyncMock(side_effect=_fake_eth_call)):
             await adapter._startup_wallet_checks()  # must NOT raise
 
-    assert any("balance_high" in r.message or "balance_ceiling" in r.message or "high" in r.message
-               for r in caplog.records), "Expected a warning about high balance"
+    assert any(
+        "balance_high" in r.message or "balance_ceiling" in r.message or "high" in r.message
+        for r in caplog.records
+    ), "Expected a warning about high balance"
 
 
 @pytest.mark.asyncio
@@ -115,3 +117,85 @@ async def test_rpc_failure_does_not_block_startup() -> None:
         new=AsyncMock(side_effect=httpx.NetworkError("connection refused")),
     ):
         await adapter._startup_wallet_checks()  # best-effort: must not raise
+
+
+# ---------------------------------------------------------------------------
+# _rpc_eth_call retry behavior (mocks the HTTP client, not _rpc_eth_call
+# itself, since that's the seam under test here).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rpc_eth_call_retries_transient_failure_then_succeeds() -> None:
+    cfg = _make_config()
+    adapter = PolymarketAdapter(Mode.PAPER, cfg)
+    adapter._http = AsyncMock(spec=httpx.AsyncClient)
+
+    success_resp = httpx.Response(
+        status_code=200,
+        json={"result": _uint256_hex(0)},
+        request=httpx.Request("POST", cfg.polygon_rpc_url),
+    )
+
+    call_count = 0
+
+    async def _fake_post(*args: object, **kwargs: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise httpx.NetworkError("connection reset")
+        return success_resp
+
+    adapter._http.post = AsyncMock(side_effect=_fake_post)
+
+    result = await adapter._rpc_eth_call(cfg.polygon_rpc_url, _DUMMY_ADDR, "0xdd62ed3e")
+
+    assert result == _uint256_hex(0)
+    assert call_count == 3  # two failures + one success, within the retry budget
+
+
+@pytest.mark.asyncio
+async def test_rpc_eth_call_does_not_retry_on_401() -> None:
+    cfg = _make_config()
+    adapter = PolymarketAdapter(Mode.PAPER, cfg)
+    adapter._http = AsyncMock(spec=httpx.AsyncClient)
+
+    unauthorized_resp = httpx.Response(
+        status_code=401,
+        text="Unauthorized",
+        request=httpx.Request("POST", cfg.polygon_rpc_url),
+    )
+
+    call_count = 0
+
+    async def _fake_post(*args: object, **kwargs: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return unauthorized_resp
+
+    adapter._http.post = AsyncMock(side_effect=_fake_post)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await adapter._rpc_eth_call(cfg.polygon_rpc_url, _DUMMY_ADDR, "0xdd62ed3e")
+
+    assert call_count == 1  # no retry on 401 — fails fast
+
+
+@pytest.mark.asyncio
+async def test_rpc_eth_call_401_still_fails_open_via_startup_wallet_checks() -> None:
+    """A 401 propagates out of _rpc_eth_call (no retry), but the outer
+    _startup_wallet_checks try/except still catches it and does not raise —
+    the fail-open contract is unchanged.
+    """
+    cfg = _make_config()
+    adapter = PolymarketAdapter(Mode.PAPER, cfg)
+    adapter._http = AsyncMock(spec=httpx.AsyncClient)
+
+    unauthorized_resp = httpx.Response(
+        status_code=401,
+        text="Unauthorized",
+        request=httpx.Request("POST", cfg.polygon_rpc_url),
+    )
+    adapter._http.post = AsyncMock(return_value=unauthorized_resp)
+
+    await adapter._startup_wallet_checks()  # best-effort: must not raise
