@@ -196,12 +196,21 @@ def start(
     async def _run() -> None:
         import httpx
 
+        from src.rules.registry import rules as rule_registry
         from src.signals.registry import signals as signal_registry
         from src.signals.runner import SignalsRuntime
         from src.signals.storage import SignalStorage
 
-        # Auto-discover all registered signals.
+        # Auto-discover all registered signals and provisional winning rules.
+        # Without the latter, any bot configuring a winning_rule (see
+        # .claude/rules/10-winning-rules.md) crashes validate_bot_winning_rule
+        # at spawn time with "Registered winning rules: []" — and since that
+        # ValueError isn't caught anywhere above this, it takes down the
+        # entire manager process, not just the one bot. Live-verified: this
+        # was never actually wired up, so the winning-rule feature has never
+        # worked in this deployment until now.
         signal_registry.autodiscover()
+        rule_registry.autodiscover()
 
         # Build the signals runtime (no-op storage stub if no Postgres).
         signals_runtime: SignalsRuntime | None = None
