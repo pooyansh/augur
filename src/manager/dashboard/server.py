@@ -36,7 +36,7 @@ from src.manager.dashboard.redact import JsonRedactor
 logger = logging.getLogger(__name__)
 
 # Path to the compiled SPA bundle relative to the project root.
-_WEB_DIST = Path(__file__).parents[4] / "web" / "dist"
+_WEB_DIST = Path(__file__).parents[3] / "web" / "dist"
 
 
 class DashboardServer:

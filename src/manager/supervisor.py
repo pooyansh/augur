@@ -1,7 +1,8 @@
 """Subprocess supervisor — spawns, monitors, and rehydrates bot processes.
 
-Each bot runs as a separate subprocess launched with
-``uv run python -m src.bots.runner --bot-id <id>``.  The supervisor:
+Each bot runs as a separate subprocess launched with the manager's own
+interpreter: ``<sys.executable> -m src.bots.runner --bot-id <id>``.  The
+supervisor:
 
 1. Reads the roster and spawns all bots.
 2. Runs a heartbeat server (unix sockets) that each bot writes to each tick.
@@ -28,6 +29,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -228,7 +230,16 @@ class SupervisorDeps:
 
 
 async def _default_spawn(entry: BotEntry, env: dict[str, str]) -> asyncio.subprocess.Process:
-    """Launch a bot subprocess with ``uv run python -m src.bots.runner``.
+    """Launch a bot subprocess with the manager's own interpreter.
+
+    Uses ``sys.executable`` (the venv python already running the manager
+    process) rather than shelling out to ``uv run`` again: by the time the
+    manager is running, ``uv sync`` has already produced the venv (at image
+    build time in the container, or via ``uv sync`` in local dev) — an
+    extra ``uv run`` invocation only adds a redundant resolve/cache step,
+    and inside the container it fails outright (``uv run``'s cache
+    directory write is incompatible with the read-only root filesystem;
+    see docker-compose.yml's ``read_only: true`` on the manager service).
 
     Args:
         entry: The bot entry to spawn.
@@ -238,9 +249,7 @@ async def _default_spawn(entry: BotEntry, env: dict[str, str]) -> asyncio.subpro
         The started :class:`asyncio.subprocess.Process`.
     """
     return await asyncio.create_subprocess_exec(
-        "uv",
-        "run",
-        "python",
+        sys.executable,
         "-m",
         "src.bots.runner",
         "--bot-id",

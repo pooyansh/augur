@@ -80,9 +80,16 @@ def cli() -> None:
 )
 @click.option(
     "--dashboard-host",
+    envvar="DASHBOARD_HOST",
     default="127.0.0.1",
     show_default=True,
-    help="Bind address for the operator dashboard (must be 127.0.0.1 in v1).",
+    help=(
+        "Bind address for the operator dashboard. Must be '127.0.0.1' "
+        "(bare-metal/dev) or '0.0.0.0' (containerized — Docker's port-publish "
+        "cannot reach a process bound to the container's own loopback; the "
+        "compose file's host-side '127.0.0.1:8090:8090' mapping is what "
+        "actually restricts reachability to localhost in that case)."
+    ),
 )
 @click.option(
     "--no-dashboard",
@@ -107,12 +114,12 @@ def start(
     and ``drain`` can find the process.
     """
     # Validate dashboard-host before doing anything else.
-    if dashboard_host != "127.0.0.1":
+    if dashboard_host not in ("127.0.0.1", "0.0.0.0"):
         click.echo(
-            f"ERROR: --dashboard-host '{dashboard_host}' is not '127.0.0.1'. "
-            "Public exposure of the dashboard is not supported in v1. "
-            "# TODO(phase-9): add bearer-token / OIDC auth before allowing "
-            "non-loopback bind addresses.",
+            f"ERROR: --dashboard-host '{dashboard_host}' is not '127.0.0.1' "
+            "or '0.0.0.0'. Public exposure of the dashboard is not supported "
+            "in v1. # TODO(phase-9): add bearer-token / OIDC auth before "
+            "allowing arbitrary bind addresses.",
             err=True,
         )
         sys.exit(1)

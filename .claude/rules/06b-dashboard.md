@@ -40,13 +40,28 @@
    never fetches from an external CDN when the manager container starts. All
    assets are served from the same origin as the API.
 
-4. **v1 is `127.0.0.1`-only.**
-   The `--dashboard-host` CLI flag rejects any value other than `127.0.0.1`
-   with a clear error and exits non-zero. Public exposure is a Phase 9
-   decision — it requires a proper auth story (bearer-token / OIDC).
+4. **v1 is `127.0.0.1`-only, reachability-wise — not necessarily bind-address-wise.**
+   The `--dashboard-host` CLI flag (`DASHBOARD_HOST` env var) accepts only
+   `127.0.0.1` or `0.0.0.0`; anything else is a clear error, exit non-zero.
+   Public exposure is a Phase 9 decision — it requires a proper auth story
+   (bearer-token / OIDC).
+
+   `0.0.0.0` is not a loosening of the invariant — it's required for the
+   containerized deployment to work at all. Docker's bridge networking
+   forwards a published port (`docker-compose.yml`'s
+   `127.0.0.1:8090:8090`) to the container's network interface, not its
+   loopback; a process bound to `127.0.0.1` *inside* the container is
+   unreachable through that port-publish, full stop (confirmed: TCP
+   handshake succeeds against the host-side proxy, backend connect to the
+   container fails silently — "empty reply from server", not a timeout).
+   The compose file sets `DASHBOARD_HOST=0.0.0.0` for exactly this reason;
+   the host-side `127.0.0.1:` prefix on the port mapping is what actually
+   enforces loopback-only reachability from outside the container. Running
+   the manager as a bare process (no Docker) keeps the `127.0.0.1` default,
+   where it works as originally documented.
 
    ```python
-   # TODO(phase-9): add bearer-token / OIDC auth before allowing non-loopback
+   # TODO(phase-9): add bearer-token / OIDC auth before allowing arbitrary
    # bind addresses.
    ```
 
