@@ -70,6 +70,11 @@ COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 # Copy application source
 COPY --chown=10001:10001 src/ ./src/
 
+# Copy Alembic config so `docker compose exec manager alembic upgrade head`
+# works against the deployed container — previously absent, leaving no way
+# to apply migrations to a running deployment at all.
+COPY --chown=10001:10001 alembic.ini ./alembic.ini
+
 # Copy the compiled SPA bundle from the web-build stage.
 # No npm in the runtime image — the bundle is already built.
 COPY --from=web-build --chown=10001:10001 /app/web/dist /app/web/dist

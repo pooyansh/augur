@@ -138,14 +138,15 @@ class DashboardDb:
         """Return the latest snapshot row for every bot.
 
         Returns:
-            List of dicts with keys: bot_id, strategy, market_id, snapshot_at,
-            version, state.
+            List of dicts with keys: bot_id, strategy, mode, market_id,
+            snapshot_at, version, state.
         """
         pool = self._require_pool()
         rows = await pool.fetch("""
             SELECT
                 bs.bot_id,
-                bs.state->>'strategy' AS strategy,
+                bs.strategy,
+                bs.mode,
                 bs.market_id,
                 bs.snapshot_at,
                 bs.version,
@@ -169,7 +170,8 @@ class DashboardDb:
             """
             SELECT
                 bs.bot_id,
-                bs.state->>'strategy' AS strategy,
+                bs.strategy,
+                bs.mode,
                 bs.market_id,
                 bs.snapshot_at,
                 bs.version,

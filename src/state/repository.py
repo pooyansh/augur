@@ -70,6 +70,8 @@ class StateRepository:
         market_id: str,
         version: int,
         state: Mapping[str, Any],
+        mode: str | None = None,
+        strategy: str | None = None,
     ) -> None:
         """Upsert a snapshot row (insert or replace, keyed on bot_id PK).
 
@@ -79,6 +81,11 @@ class StateRepository:
                 deferred ``market_history`` view (Phase 5).
             version: Monotonically increasing snapshot version counter.
             state: Arbitrary serialisable dict from :meth:`BaseBot.snapshot`.
+            mode: The bot's actual configured mode (``"paper"``/``"live"``),
+                from ``BotConfig`` — not part of the JSONB ``state`` contract.
+                Dashboard-facing only; see :class:`~src.state.models.BotState`.
+            strategy: The bot's registered strategy name, from ``BotConfig``.
+                Dashboard-facing only, same as ``mode``.
         """
         async with self._sf() as session:
             existing = await session.get(BotState, bot_id)
@@ -90,6 +97,8 @@ class StateRepository:
                         version=version,
                         market_id=market_id,
                         state=dict(state),
+                        mode=mode,
+                        strategy=strategy,
                     )
                 )
             else:
@@ -97,6 +106,8 @@ class StateRepository:
                 existing.version = version  # type: ignore[assignment]
                 existing.market_id = market_id  # type: ignore[assignment]
                 existing.state = dict(state)  # type: ignore[assignment]
+                existing.mode = mode  # type: ignore[assignment]
+                existing.strategy = strategy  # type: ignore[assignment]
             await session.commit()
 
 

@@ -837,6 +837,8 @@ class BaseBot(ABC):
                 market_id=self._config.market_id,
                 version=version,
                 state=snap,
+                mode=self._config.mode,
+                strategy=self._config.strategy_name,
             )
             # After a successful snapshot, reset the lag gauge to 0.
             try:

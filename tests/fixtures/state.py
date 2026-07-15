@@ -39,6 +39,8 @@ class InMemoryStateRepository:
         market_id: str,
         version: int,
         state: Mapping[str, Any],
+        mode: str | None = None,
+        strategy: str | None = None,
     ) -> None:
         """Upsert the snapshot for ``bot_id``."""
         self._store[bot_id] = dict(state)

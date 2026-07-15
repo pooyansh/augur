@@ -32,10 +32,16 @@ _NOW = datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC)
 _FAKE_BOT_STATE: dict[str, Any] = {
     "bot_id": "bot-001",
     "strategy": "momentum_v1",
+    # Real bot_state.mode column — deliberately "live" here while the JSONB
+    # state blob below has no "mode" key at all (no strategy's snapshot()
+    # ever writes one), so a test reading the wrong source would show
+    # "paper" instead. Regression coverage for the dashboard bug where
+    # mode/strategy were derived from state->>'...' instead of real columns.
+    "mode": "live",
     "market_id": "market-abc",
     "snapshot_at": _NOW,
     "version": 42,
-    "state": {"mode": "paper", "intent_seq": 7, "position": "0.5"},
+    "state": {"intent_seq": 7, "position": "0.5"},
 }
 
 _FAKE_AUDIT_ROW: dict[str, Any] = {
@@ -265,6 +271,12 @@ def test_bots_list_shape() -> None:
     assert bot["bot_id"] == "bot-001"
     assert bot["market_id"] == "market-abc"
     assert "state" in bot
+    # mode/strategy must come from the real bot_state columns, not from
+    # state->>'...' — the JSONB blob has no "mode" key at all (see
+    # _FAKE_BOT_STATE), so "live" here (not the "paper" default fallback)
+    # proves the real column is what's being read.
+    assert bot["mode"] == "live"
+    assert bot["strategy"] == "momentum_v1"
 
 
 def test_bots_list_etag_304() -> None:
@@ -289,6 +301,8 @@ def test_bot_detail_shape() -> None:
     assert body["bot_id"] == "bot-001"
     assert "recent_audit" in body
     assert isinstance(body["recent_audit"], list)
+    assert body["mode"] == "live"
+    assert body["strategy"] == "momentum_v1"
 
 
 def test_bot_detail_404_when_not_found() -> None:

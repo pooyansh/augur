@@ -38,6 +38,13 @@ class BotState(Base):
 
     Additional strategy-specific keys are allowed alongside these required ones.
 
+    ``mode`` and ``strategy`` are plain columns, not part of the JSONB
+    contract above — they're written by ``BaseBot._persist_snapshot`` from
+    ``BotConfig`` (the bot's actual configured mode/strategy_name), not by
+    strategy authors. They exist purely so the dashboard can report a bot's
+    real mode/strategy without depending on a key no strategy is required
+    (or expected) to include in its own ``snapshot()``.
+
     Indexes:
         - ``(market_id, snapshot_at DESC)`` — supports the deferred
           ``market_history`` view (SQL view ships in Phase 5; index added now
@@ -57,6 +64,8 @@ class BotState(Base):
     version = Column(Integer, nullable=False)
     market_id = Column(Text, nullable=False)
     state = Column(JSONB, nullable=False)
+    mode = Column(String(20), nullable=True)
+    strategy = Column(Text, nullable=True)
 
     __table_args__ = (
         # Phase 5 market_history view will use this index — deferred, see Phase 5.
