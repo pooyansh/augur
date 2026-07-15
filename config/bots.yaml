@@ -81,14 +81,26 @@ bots:
   # LIVE — requires this bot id in the manager's live_allowlist.yaml
   # (three-lock rule, CLAUDE.md invariant 1) or it fails closed to paper.
   #
-  # PAUSED 2026-07-15: repeated live order attempts from the manager
-  # container were rejected by Polymarket with "Trading restricted in your
-  # region" (geoblock), while the same wallet/creds placed an order fine
-  # from the host directly via scripts/snipe_bot.py minutes later. Suspected
-  # cause: the container's egress IP (same ISP/subnet as the host, but a
-  # different specific address) lands in a flagged range within that
-  # provider's pool. Re-enable only after the network path is understood —
-  # see conversation notes / investigate before uncommenting.
+  # PAUSED again 2026-07-15: re-enabled earlier the same day, immediately
+  # hit the same geoblock wall (3/3 rejected). Ruled out two hypotheses
+  # this round:
+  #   1. Credentials differ between snipe_bot.py and the manager path —
+  #      false. Both resolve to the exact same wallet/API key (verified via
+  #      Secrets.slice_for("exchanges.polymarket") vs snipe_bot's
+  #      secrets.get("polymarket", secrets) — identical dict).
+  #   2. The adapter's shared, process-lifetime httpx client sticks to one
+  #      (possibly bad) VPN exit IP for the bot's whole life — plausible
+  #      but the fix (src/exchanges/polymarket.py::_place_live now opens a
+  #      dedicated short-lived client per order, forcing a fresh TCP
+  #      connection every attempt) did NOT change the outcome; kept anyway,
+  #      it's a harmless improvement.
+  # Live tally as of this pause: manager path ~0/14 accepted across all
+  # sessions; snipe_bot.py 1/2 from the host (small sample). Root cause
+  # still unconfirmed — leading unverified theory is Polymarket's fraud
+  # detection weighing request pattern/volume (dip_snipe polls every 5s
+  # continuously; snipe_bot makes a handful of calls and exits), not pure
+  # per-request IP luck. Re-enable only with a specific new hypothesis to
+  # test, not just to retry.
   # - id: btc-dipsnipe-5m-live-1
   #   strategy: dip_snipe_3round
   #   market:

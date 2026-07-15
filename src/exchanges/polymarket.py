@@ -466,11 +466,25 @@ class PolymarketAdapter(ExchangeAdapter):
         }
 
         try:
-            resp = await self._http.post(
-                f"{self._config.clob_host}/order",
-                content=body_str.encode(),
-                headers=headers,
-            )
+            # Deliberately NOT self._http (the adapter's shared, process-lifetime
+            # client): that client stays alive across every tick via frequent
+            # read-only polling, so its underlying TCP connection can persist
+            # for the bot's entire runtime. If it was established through a
+            # VPN/proxy exit IP that Polymarket's fraud detection flags, every
+            # order placed over that same connection inherits the same
+            # rejection for as long as the process lives — no amount of
+            # retrying escapes it. A dedicated short-lived client here forces
+            # a brand-new TCP connection (and thus a new egress IP, when
+            # traffic is routed through a rotating VPN/proxy) on every single
+            # order attempt, independent of the shared client's connection
+            # lifetime — matching scripts/snipe_bot.py's per-invocation-fresh-
+            # process behavior, which does not exhibit this failure mode.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as fresh_client:
+                resp = await fresh_client.post(
+                    f"{self._config.clob_host}/order",
+                    content=body_str.encode(),
+                    headers=headers,
+                )
         except httpx.TimeoutException as exc:
             logger.warning("polymarket_place_timeout", extra={"error": str(exc)})
             return OrderResult(
