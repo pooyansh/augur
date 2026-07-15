@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import httpx
 import pytest
+import respx
 from src.bots.base import BotConfig, BotDeps, LocalHeartbeat, RiskCaps, Schedule
-from src.bots.dip_snipe.strategy import DipSnipe3Round
+from src.bots.dip_snipe.strategy import DipSnipe3Round, _check_clob_settlement
 from src.exchanges.base import Market, Mode
 from src.exchanges.market_resolver import ResolvedMarket
 
@@ -171,6 +173,168 @@ async def test_third_loss_stops_at_max_rounds(monkeypatch: pytest.MonkeyPatch) -
     assert d.note == "round_lost_max_rounds_stopping"
 
 
+# ---------------------------------------------------------------------------
+# Fast-rule continuation (opt-in; .claude/rules/10-winning-rules.md)
+#
+# Explicit, accepted tradeoff: advance past a round on FAST_LOSS_STREAK
+# consecutive provisional LOST readings, without waiting for authoritative
+# settlement — the ruling can flip-flop, so a wrong fast read must be
+# corrected once the real result is known rather than compounding silently.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_does_not_advance_before_streak_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.bots.dip_snipe.strategy as mod
+    from src.rules.base import ProvisionalRuling
+
+    bot = _make_bot()
+
+    async def never_settled(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return None
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", never_settled)
+    await _run_round_to_open(bot, monkeypatch, up_ask=Decimal("0.25"), dn_ask=Decimal("0.90"))
+
+    bot._provisional_ruling_cache = ProvisionalRuling.LOST
+    for _ in range(DipSnipe3Round.FAST_LOSS_STREAK - 1):
+        d = await bot._tick_awaiting_settlement()
+        assert d.note == "awaiting_settlement"
+        assert bot._phase == "awaiting_settlement"
+
+    assert bot._pending_validations == []
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_advances_after_loss_streak(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.bots.dip_snipe.strategy as mod
+    from src.rules.base import ProvisionalRuling
+
+    bot = _make_bot()
+
+    async def never_settled(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return None
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", never_settled)
+    await _run_round_to_open(bot, monkeypatch, up_ask=Decimal("0.25"), dn_ask=Decimal("0.90"))
+    condition_id = bot._condition_id
+
+    bot._provisional_ruling_cache = ProvisionalRuling.LOST
+    d = None
+    for _ in range(DipSnipe3Round.FAST_LOSS_STREAK):
+        d = await bot._tick_awaiting_settlement()
+
+    assert d is not None
+    assert d.note == "round_lost_continuing_fast"
+    assert bot._finished is False
+    assert bot._phase == "resolving"
+    assert len(bot._pending_validations) == 1
+    assert bot._pending_validations[0]["condition_id"] == condition_id
+    assert bot._pending_validations[0]["round_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_correction_stops_on_actual_win(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A round fast-advanced as a loss that authoritative settlement later
+    shows was a WIN must stop the strategy — honoring "stop on win" even
+    though it already moved on, rather than silently placing more rounds."""
+    import src.bots.dip_snipe.strategy as mod
+    from src.rules.base import ProvisionalRuling
+
+    bot = _make_bot()
+
+    async def never_settled(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return None
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", never_settled)
+    await _run_round_to_open(bot, monkeypatch, up_ask=Decimal("0.25"), dn_ask=Decimal("0.90"))
+
+    bot._provisional_ruling_cache = ProvisionalRuling.LOST
+    for _ in range(DipSnipe3Round.FAST_LOSS_STREAK):
+        await bot._tick_awaiting_settlement()
+
+    assert bot._finished is False
+    assert len(bot._pending_validations) == 1
+
+    async def actually_won(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", actually_won)
+    d = await bot._check_pending_validations()
+
+    assert d is not None
+    assert d.note == "fast_rule_correction_actually_won_stopping"
+    assert bot._finished is True
+    assert bot._won is True
+    assert bot._pending_validations == []
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_correction_confirms_actual_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.bots.dip_snipe.strategy as mod
+    from src.rules.base import ProvisionalRuling
+
+    bot = _make_bot()
+
+    async def never_settled(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return None
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", never_settled)
+    await _run_round_to_open(bot, monkeypatch, up_ask=Decimal("0.25"), dn_ask=Decimal("0.90"))
+
+    bot._provisional_ruling_cache = ProvisionalRuling.LOST
+    for _ in range(DipSnipe3Round.FAST_LOSS_STREAK):
+        await bot._tick_awaiting_settlement()
+
+    assert len(bot._pending_validations) == 1
+
+    async def actually_lost(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return Decimal("0.0")
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", actually_lost)
+    d = await bot._check_pending_validations()
+
+    assert d is None
+    assert bot._finished is False
+    assert bot._pending_validations == []
+
+
+@pytest.mark.asyncio
+async def test_current_position_none_outside_awaiting_settlement() -> None:
+    bot = _make_bot()
+    assert bot._phase == "resolving"
+    assert bot.current_position() is None
+
+
+@pytest.mark.asyncio
+async def test_current_position_reports_when_awaiting_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    import src.bots.dip_snipe.strategy as mod
+
+    bot = _make_bot()
+
+    async def never_settled(client: object, condition_id: str, token_id: str) -> Decimal | None:
+        return None
+
+    monkeypatch.setattr(mod, "_check_clob_settlement", never_settled)
+    await _run_round_to_open(bot, monkeypatch, up_ask=Decimal("0.25"), dn_ask=Decimal("0.90"))
+
+    # _run_round_to_open drives ticks with signals=None, so entry_btc_price
+    # is never captured — set it directly to exercise current_position().
+    bot._entry_btc_price = Decimal("65000")
+    bot._entry_at = datetime.now(tz=UTC)
+
+    pos = bot.current_position()
+    assert pos is not None
+    assert pos.side == "Up"
+    assert pos.entry_reference == Decimal("65000")
+
+
 @pytest.mark.asyncio
 async def test_rejected_order_does_not_consume_a_round(monkeypatch: pytest.MonkeyPatch) -> None:
     import time
@@ -291,3 +455,93 @@ async def test_finished_bot_never_places_orders(monkeypatch: pytest.MonkeyPatch)
     for _ in range(5):
         d = await bot.on_tick(signals=None)  # type: ignore[arg-type]
         assert d.intents == []
+
+
+# ---------------------------------------------------------------------------
+# _check_clob_settlement — race-condition hardening
+#
+# Regression coverage for a live-observed bug: closed=true can appear on a
+# CLOB /markets response before winner/price have finished settling to
+# their terminal 0/1 values (or via a stale cached response, given the
+# CLOB sits behind Cloudflare). The old check trusted any "winner" key
+# being *present* (even False) as proof of finality — this confirms the
+# fix requires an explicit winner=True on some token first.
+# ---------------------------------------------------------------------------
+
+_CONDITION_ID = "0xabc123"
+_UP_TOKEN = "up-token-id"
+_DOWN_TOKEN = "down-token-id"
+
+
+@pytest.mark.asyncio
+async def test_settlement_not_closed_returns_none() -> None:
+    async with httpx.AsyncClient() as client:
+        with respx.mock(assert_all_mocked=True) as mock:
+            mock.get(f"https://clob.polymarket.com/markets/{_CONDITION_ID}").mock(
+                return_value=httpx.Response(200, json={"closed": False, "tokens": []})
+            )
+            payout = await _check_clob_settlement(client, _CONDITION_ID, _UP_TOKEN)
+    assert payout is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_closed_but_no_winner_true_returns_none() -> None:
+    """closed=true with only winner=False keys present must NOT be trusted —
+    this is exactly the race window that produced a live misread."""
+    async with httpx.AsyncClient() as client:
+        with respx.mock(assert_all_mocked=True) as mock:
+            mock.get(f"https://clob.polymarket.com/markets/{_CONDITION_ID}").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "closed": True,
+                        "tokens": [
+                            {"token_id": _UP_TOKEN, "price": 0.4, "winner": False},
+                            {"token_id": _DOWN_TOKEN, "price": 0.6, "winner": False},
+                        ],
+                    },
+                )
+            )
+            payout = await _check_clob_settlement(client, _CONDITION_ID, _UP_TOKEN)
+    assert payout is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_closed_with_winner_returns_correct_payout() -> None:
+    async with httpx.AsyncClient() as client:
+        with respx.mock(assert_all_mocked=True) as mock:
+            mock.get(f"https://clob.polymarket.com/markets/{_CONDITION_ID}").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "closed": True,
+                        "tokens": [
+                            {"token_id": _UP_TOKEN, "price": 1, "winner": True},
+                            {"token_id": _DOWN_TOKEN, "price": 0, "winner": False},
+                        ],
+                    },
+                )
+            )
+            payout = await _check_clob_settlement(client, _CONDITION_ID, _UP_TOKEN)
+    assert payout == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_settlement_returns_losing_tokens_own_payout() -> None:
+    """Payout returned is for the *fired* token specifically, not whichever won."""
+    async with httpx.AsyncClient() as client:
+        with respx.mock(assert_all_mocked=True) as mock:
+            mock.get(f"https://clob.polymarket.com/markets/{_CONDITION_ID}").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "closed": True,
+                        "tokens": [
+                            {"token_id": _UP_TOKEN, "price": 1, "winner": True},
+                            {"token_id": _DOWN_TOKEN, "price": 0, "winner": False},
+                        ],
+                    },
+                )
+            )
+            payout = await _check_clob_settlement(client, _CONDITION_ID, _DOWN_TOKEN)
+    assert payout == Decimal("0")

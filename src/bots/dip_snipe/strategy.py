@@ -26,7 +26,25 @@ Snapshot keys (beyond the BaseBot-mandatory three):
 - ``condition_id``, ``full_slug``, ``up_token``, ``dn_token`` (str | null)
 - ``window_end`` (float | null)
 - ``fired_token``, ``fired_outcome``, ``entry_price`` (str | null)
+- ``entry_btc_price``, ``entry_at`` (str | null) — captured at trigger time
+  for the optional provisional-winning-rule fast path (below)
 - ``pending_coid`` (str | null)
+- ``provisional_loss_streak`` (int), ``pending_validations`` (list) — fast
+  provisional-rule continuation state, see class docstring
+
+Optional fast-rule continuation (opt-in, see .claude/rules/10-winning-rules.md):
+when a winning_rule is configured in config/bots.yaml and the btc_15min
+signal is subscribed, ``_tick_awaiting_settlement`` no longer blocks
+indefinitely on Polymarket's official closed+winner fields (which can lag
+minutes). After ``FAST_LOSS_STREAK`` consecutive LOST provisional rulings,
+it advances to the next round as if lost, real capital included. This is a
+deliberate, accepted tradeoff: the provisional rule can flip-flop, so a
+wrong fast read can cause an extra real order before the true result is
+known. Every fast-advanced round is tracked in ``_pending_validations`` and
+re-checked against authoritative settlement every tick thereafter — if it
+turns out to have actually been a win, the strategy stops immediately
+(honors "stop on win" even late) rather than silently compounding the
+error with further rounds.
 """
 
 from __future__ import annotations
@@ -36,7 +54,8 @@ __all__ = ["DipSnipe3Round"]
 import asyncio
 import logging
 import time
-from decimal import ROUND_UP, Decimal
+from datetime import datetime
+from decimal import ROUND_UP, Decimal, InvalidOperation
 from typing import Any, ClassVar, Literal, cast
 
 import httpx
@@ -46,6 +65,7 @@ from src.exchanges.base import Market, OrderTemplate, Side
 from src.exchanges.market_resolver import resolve_all_outcomes
 from src.manager.config import MarketRef
 from src.manager.registry import registry
+from src.rules.base import PositionState, ProvisionalRuling
 from src.signals.base import SignalSnapshot
 
 logger = logging.getLogger(__name__)
@@ -81,18 +101,52 @@ async def _best_ask(client: httpx.AsyncClient, token_id: str) -> Decimal:
     return min(prices) if prices else Decimal("1")
 
 
+def _btc_price_from_signals(signals: SignalSnapshot | None) -> Decimal | None:
+    """Read the live BTC price from the btc_15min signal, if fresh and present.
+
+    Mirrors the same signal/field access as
+    ``src/rules/polymarket/btc_up_or_down_5m/price_compare.py`` — needed
+    here too so ``current_position()`` can report an ``entry_reference``
+    for that rule to compare against. Returns ``None`` if the signal isn't
+    configured, is stale, or doesn't parse — the fast-rule feature is
+    inert in that case, not an error.
+    """
+    if signals is None or "btc_15min" in signals.stale or "btc_15min" not in signals.samples:
+        return None
+    try:
+        return Decimal(str(signals.samples["btc_15min"]["price_usd"]))
+    except (KeyError, TypeError, InvalidOperation):
+        return None
+
+
 async def _check_clob_settlement(
     client: httpx.AsyncClient, condition_id: str, token_id: str
 ) -> Decimal | None:
     """Query the CLOB for settlement; return the token's payout if resolved.
 
-    Mirrors ``scripts/snipe_bot.py::_check_clob_settlement`` (proven,
-    live-verified pattern) — CLOB, not Gamma, per
-    ``.claude/rules/05-exchanges.md``.  Returns ``None`` if not yet settled
-    or the request fails.
+    Based on ``scripts/snipe_bot.py::_check_clob_settlement`` — CLOB, not
+    Gamma, per ``.claude/rules/05-exchanges.md``. Returns ``None`` if not
+    yet settled or the request fails.
+
+    Two hardening changes vs. the original pattern, found live: this
+    strategy polls every 5s (vs. snipe_bot.py's 30s), which is frequent
+    enough to catch a real race window right as a market resolves —
+    observed directly: the same condition_id returned ``closed: false``
+    and, seconds later, ``closed: true`` with final winner/price data.
+    ``"winner" in tok`` only checks the key is *present*, not that it's
+    ``True`` — if the CLOB (behind Cloudflare, per its response headers)
+    ever serves a cached or transitional response where `closed` has
+    flipped but price/winner haven't finished settling to their terminal
+    0/1 values, this would misread an interim price as the final payout.
+    Fixed by requiring at least one token to be explicitly winner=True
+    before trusting any token's price, and by cache-busting the request.
     """
     try:
-        r = await client.get(f"{_CLOB_HOST}/markets/{condition_id}", timeout=10)
+        r = await client.get(
+            f"{_CLOB_HOST}/markets/{condition_id}",
+            timeout=10,
+            headers={"Cache-Control": "no-cache"},
+        )
         r.raise_for_status()
         data: dict[str, Any] = r.json()
     except Exception as exc:
@@ -100,8 +154,14 @@ async def _check_clob_settlement(
         return None
     if not data.get("closed"):
         return None
-    for tok in data.get("tokens", []):
-        if tok.get("token_id") == token_id and "winner" in tok:
+    tokens = data.get("tokens", [])
+    if not any(tok.get("winner") is True for tok in tokens):
+        # closed=true but resolution hasn't finished settling winner/price
+        # on this response — not an error, just not final yet. Try again
+        # next tick rather than trusting an interim price.
+        return None
+    for tok in tokens:
+        if tok.get("token_id") == token_id:
             return Decimal(str(tok["price"]))
     return None
 
@@ -125,6 +185,11 @@ class DipSnipe3Round(BaseBot):
     MAX_ROUNDS: ClassVar[int] = 3
     MIN_WINDOW_SECS: ClassVar[int] = 120
     AWAITING_FILL_TIMEOUT_SECS: ClassVar[float] = 15.0
+
+    # Consecutive same-direction provisional rulings required before the
+    # fast path acts on a LOST reading — the rule is expected to flip-flop
+    # (.claude/rules/10-winning-rules.md), so a single tick is not enough.
+    FAST_LOSS_STREAK: ClassVar[int] = 3
 
     def __init__(self, market: Market, config: BotConfig, deps: BotDeps) -> None:
         super().__init__(market, config, deps)
@@ -158,14 +223,54 @@ class DipSnipe3Round(BaseBot):
         self._pending_coid: str | None = None
         self._awaiting_fill_since: float | None = None
 
+        # Fast-rule continuation state (opt-in via config/bots.yaml
+        # winning_rule + signals — inert when neither is configured, since
+        # current_position() only reports a position while genuinely
+        # awaiting settlement and provisional_ruling() is None without a
+        # configured rule).
+        self._entry_btc_price: Decimal | None = None
+        self._entry_at: datetime | None = None
+        self._provisional_loss_streak: int = 0
+        # Rounds advanced past on the fast rule's word, not yet confirmed by
+        # authoritative settlement — checked every tick regardless of phase
+        # so a wrong fast read still gets corrected once the real result is
+        # known (see _check_pending_validations).
+        self._pending_validations: list[dict[str, Any]] = []
+
+    def current_position(self) -> PositionState | None:
+        """Expose the held position while awaiting settlement, for the
+        optional provisional-winning-rule feature
+        (.claude/rules/10-winning-rules.md). Returns None whenever there's
+        nothing held — inert unless a winning_rule is also configured."""
+        if self._phase != "awaiting_settlement":
+            return None
+        if (
+            self._condition_id is None
+            or self._fired_outcome is None
+            or self._entry_btc_price is None
+            or self._entry_at is None
+        ):
+            return None
+        return PositionState(
+            market_id=self._condition_id,
+            side=self._fired_outcome,
+            entry_reference=self._entry_btc_price,
+            entry_at=self._entry_at,
+            size=self._size,
+        )
+
     async def on_tick(self, signals: SignalSnapshot) -> Decision:
         if self._finished:
             return Decision(note=f"finished_{'won' if self._won else 'max_rounds'}")
 
+        validation_decision = await self._check_pending_validations()
+        if validation_decision is not None:
+            return validation_decision
+
         if self._phase == "resolving":
             return await self._tick_resolving()
         if self._phase == "watching":
-            return await self._tick_watching()
+            return await self._tick_watching(signals)
         if self._phase == "awaiting_fill":
             return self._tick_awaiting_fill()
         if self._phase == "awaiting_settlement":
@@ -209,7 +314,7 @@ class DipSnipe3Round(BaseBot):
         )
         return Decision(note=f"market_resolved slug={resolved.slug} up={up_label} dn={dn_label}")
 
-    async def _tick_watching(self) -> Decision:
+    async def _tick_watching(self, signals: SignalSnapshot) -> Decision:
         assert self._window_end is not None
         assert self._up_token is not None
         assert self._dn_token is not None
@@ -241,6 +346,8 @@ class DipSnipe3Round(BaseBot):
                 self._fired_token = token_id
                 self._fired_outcome = outcome_name
                 self._entry_price = ask
+                self._entry_btc_price = _btc_price_from_signals(signals)
+                self._entry_at = self._deps.clock.now()
                 self._pending_coid = self._peek_next_client_order_id()
                 self._awaiting_fill_since = time.time()
                 self._phase = "awaiting_fill"
@@ -312,6 +419,8 @@ class DipSnipe3Round(BaseBot):
         self._fired_token = None
         self._fired_outcome = None
         self._entry_price = None
+        self._entry_btc_price = None
+        self._entry_at = None
         self._pending_coid = None
         self._awaiting_fill_since = None
         self._phase = "watching" if (self._window_end or 0) > time.time() else "resolving"
@@ -321,13 +430,49 @@ class DipSnipe3Round(BaseBot):
         assert self._fired_token is not None
 
         payout = await _check_clob_settlement(self._http, self._condition_id, self._fired_token)
-        if payout is None:
+        if payout is not None:
+            self._provisional_loss_streak = 0
+            return self._resolve_round(payout)
+
+        # Authoritative settlement not yet available — consult the fast
+        # provisional rule (if configured) so the bot doesn't block on
+        # Polymarket's official closed+winner fields, which can lag.
+        # Explicit, accepted tradeoff (.claude/rules/10-winning-rules.md):
+        # the ruling can flip-flop, so this can advance past a round that
+        # authoritative settlement later reveals was actually a win —
+        # tracked in _pending_validations and corrected by
+        # _check_pending_validations once the real result is known.
+        ruling = self.provisional_ruling()
+        if ruling == ProvisionalRuling.LOST:
+            self._provisional_loss_streak += 1
+        else:
+            self._provisional_loss_streak = 0
+
+        if self._provisional_loss_streak < self.FAST_LOSS_STREAK:
             return Decision(note="awaiting_settlement")
 
+        logger.warning(
+            "dip_snipe bot=%s fast rule: %d consecutive LOST readings, advancing "
+            "without authoritative settlement (round=%d) — pending validation",
+            self._config.bot_id,
+            self._provisional_loss_streak,
+            self._rounds_played,
+        )
+        self._pending_validations.append(
+            {
+                "condition_id": self._condition_id,
+                "fired_token": self._fired_token,
+                "round_index": self._rounds_played,
+            }
+        )
+        self._provisional_loss_streak = 0
         self._position_notional = Decimal("0")
-        won_this_round = payout >= Decimal("0.5")
+        return self._advance_after_loss(fast=True)
 
-        if won_this_round:
+    def _resolve_round(self, payout: Decimal) -> Decision:
+        """Apply an authoritative settlement payout: win stops, loss advances."""
+        self._position_notional = Decimal("0")
+        if payout >= Decimal("0.5"):
             self._won = True
             self._finished = True
             logger.info(
@@ -336,26 +481,87 @@ class DipSnipe3Round(BaseBot):
                 self._rounds_played,
             )
             return Decision(note="round_won_stopping")
+        return self._advance_after_loss(fast=False)
 
+    def _advance_after_loss(self, *, fast: bool) -> Decision:
+        """Stop if max_rounds reached, else reset and move to the next window.
+
+        Args:
+            fast: True if this loss was decided by the fast provisional
+                rule rather than authoritative settlement (logged/noted
+                distinctly; see _pending_validations for the correction path).
+        """
+        suffix = "_fast" if fast else ""
         if self._rounds_played >= self._max_rounds:
             self._won = False
             self._finished = True
             logger.info(
-                "dip_snipe bot=%s max rounds (%d) reached, last round lost — stopping.",
+                "dip_snipe bot=%s max rounds (%d) reached, last round lost%s — stopping.",
                 self._config.bot_id,
                 self._max_rounds,
+                " (fast rule, pending validation)" if fast else "",
             )
-            return Decision(note="round_lost_max_rounds_stopping")
+            return Decision(note=f"round_lost_max_rounds_stopping{suffix}")
 
         self._reset_round_fields()
         self._phase = "resolving"
         logger.info(
-            "dip_snipe bot=%s round lost (%d/%d) — continuing to next window.",
+            "dip_snipe bot=%s round lost (%d/%d)%s — continuing to next window.",
             self._config.bot_id,
             self._rounds_played,
             self._max_rounds,
+            " (fast rule, pending validation)" if fast else "",
         )
-        return Decision(note="round_lost_continuing")
+        return Decision(note=f"round_lost_continuing{suffix}")
+
+    async def _check_pending_validations(self) -> Decision | None:
+        """Reconcile any rounds advanced past via the fast rule.
+
+        Runs every tick regardless of phase. If authoritative settlement
+        later shows a fast-advanced round was actually a WIN, honors
+        "stop on win" immediately even though the strategy already moved
+        on — better a late correction than silently compounding the error
+        with further real rounds. A confirmed loss just gets dropped
+        (nothing to correct).
+
+        Returns:
+            A stopping Decision if a correction fired this tick, else None
+            (meaning: proceed with the normal phase-dispatch tick as usual).
+        """
+        if not self._pending_validations or self._finished:
+            return None
+
+        still_pending: list[dict[str, Any]] = []
+        for entry in self._pending_validations:
+            payout = await _check_clob_settlement(
+                self._http, entry["condition_id"], entry["fired_token"]
+            )
+            if payout is None:
+                still_pending.append(entry)
+                continue
+
+            if payout >= Decimal("0.5"):
+                logger.error(
+                    "dip_snipe bot=%s fast-rule correction: round=%d was actually a "
+                    "WIN (condition_id=%s) — stopping now despite having already "
+                    "continued past it.",
+                    self._config.bot_id,
+                    entry["round_index"],
+                    entry["condition_id"],
+                )
+                self._won = True
+                self._finished = True
+                self._pending_validations = still_pending
+                return Decision(note="fast_rule_correction_actually_won_stopping")
+
+            logger.info(
+                "dip_snipe bot=%s fast-rule validation confirmed: round=%d was correctly a loss.",
+                self._config.bot_id,
+                entry["round_index"],
+            )
+
+        self._pending_validations = still_pending
+        return None
 
     def _reset_round_fields(self) -> None:
         self._condition_id = None
@@ -366,6 +572,8 @@ class DipSnipe3Round(BaseBot):
         self._fired_token = None
         self._fired_outcome = None
         self._entry_price = None
+        self._entry_btc_price = None
+        self._entry_at = None
         self._pending_coid = None
 
     def _peek_next_client_order_id(self) -> str:
@@ -401,8 +609,14 @@ class DipSnipe3Round(BaseBot):
             "fired_token": self._fired_token,
             "fired_outcome": self._fired_outcome,
             "entry_price": str(self._entry_price) if self._entry_price is not None else None,
+            "entry_btc_price": (
+                str(self._entry_btc_price) if self._entry_btc_price is not None else None
+            ),
+            "entry_at": self._entry_at.isoformat() if self._entry_at is not None else None,
             "pending_coid": self._pending_coid,
             "awaiting_fill_since": self._awaiting_fill_since,
+            "provisional_loss_streak": self._provisional_loss_streak,
+            "pending_validations": list(self._pending_validations),
         }
 
     def rehydrate(self, snapshot: dict[str, Any]) -> None:
@@ -421,5 +635,13 @@ class DipSnipe3Round(BaseBot):
         self._fired_outcome = snapshot.get("fired_outcome")
         entry_price = snapshot.get("entry_price")
         self._entry_price = Decimal(str(entry_price)) if entry_price is not None else None
+        entry_btc_price = snapshot.get("entry_btc_price")
+        self._entry_btc_price = (
+            Decimal(str(entry_btc_price)) if entry_btc_price is not None else None
+        )
+        entry_at = snapshot.get("entry_at")
+        self._entry_at = datetime.fromisoformat(entry_at) if entry_at else None
         self._pending_coid = snapshot.get("pending_coid")
         self._awaiting_fill_since = snapshot.get("awaiting_fill_since")
+        self._provisional_loss_streak = int(snapshot.get("provisional_loss_streak", 0))
+        self._pending_validations = list(snapshot.get("pending_validations", []))

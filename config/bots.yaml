@@ -81,46 +81,52 @@ bots:
   # LIVE — requires this bot id in the manager's live_allowlist.yaml
   # (three-lock rule, CLAUDE.md invariant 1) or it fails closed to paper.
   #
-  # PAUSED again 2026-07-15: re-enabled earlier the same day, immediately
-  # hit the same geoblock wall (3/3 rejected). Ruled out two hypotheses
-  # this round:
-  #   1. Credentials differ between snipe_bot.py and the manager path —
-  #      false. Both resolve to the exact same wallet/API key (verified via
-  #      Secrets.slice_for("exchanges.polymarket") vs snipe_bot's
-  #      secrets.get("polymarket", secrets) — identical dict).
-  #   2. The adapter's shared, process-lifetime httpx client sticks to one
-  #      (possibly bad) VPN exit IP for the bot's whole life — plausible
-  #      but the fix (src/exchanges/polymarket.py::_place_live now opens a
-  #      dedicated short-lived client per order, forcing a fresh TCP
-  #      connection every attempt) did NOT change the outcome; kept anyway,
-  #      it's a harmless improvement.
-  # Live tally as of this pause: manager path ~0/14 accepted across all
-  # sessions; snipe_bot.py 1/2 from the host (small sample). Root cause
-  # still unconfirmed — leading unverified theory is Polymarket's fraud
-  # detection weighing request pattern/volume (dip_snipe polls every 5s
-  # continuously; snipe_bot makes a handful of calls and exits), not pure
-  # per-request IP luck. Re-enable only with a specific new hypothesis to
-  # test, not just to retry.
-  # - id: btc-dipsnipe-5m-live-1
-  #   strategy: dip_snipe_3round
-  #   market:
-  #     exchange: polymarket
-  #     slug: "btc-updown-5m"
-  #     outcome: "UP"
-  #   mode: live
-  #   schedule: "every:5s"
-  #   signals: []
-  #   params:
-  #     trigger: "0.30"
-  #     size: "5"
-  #     max_rounds: 3
-  #     min_window_secs: 120
-  #     slug: "btc-updown-5m"
-  #     outcome: "UP"
-  #     exchange: "polymarket"
-  #   risk:
-  #     max_position_notional: "20"
-  #     max_daily_loss: "10"
-  #     max_orders_per_minute: 5
-  #   secrets:
-  #     exchange_credentials: "polymarket.live"
+  # Re-enabled 2026-07-15 with a new diagnostic: PolymarketAdapter._place_live
+  # now pre-checks https://polymarket.com/api/geoblock immediately before
+  # every order (same check Polymarket's own frontend uses). blocked=true
+  # short-circuits the attempt without hitting /order; either way the result
+  # is logged (polymarket_geoblock_precheck) for correlation against accept/
+  # reject outcomes. Prior hypotheses ruled out: credentials (identical to
+  # snipe_bot.py's path, verified), and long-lived-connection IP pinning
+  # (fixed, didn't change the outcome). Live tally before this change:
+  # manager path ~0/14 accepted, snipe_bot.py ~2/4 from the host.
+  #
+  # winning_rule added same day: opts into the fast provisional-rule
+  # continuation path in dip_snipe_3round (see its module docstring and
+  # .claude/rules/10-winning-rules.md) — after FAST_LOSS_STREAK consecutive
+  # LOST provisional readings, the strategy advances to the next round
+  # instead of blocking on Polymarket's official closed+winner fields
+  # (observed to lag several minutes). Explicit, accepted tradeoff: the
+  # rule can flip-flop, so a wrong fast read can fire an extra real order
+  # before the true result is known — corrected after the fact once
+  # authoritative settlement confirms it (dip_snipe_3round._pending_validations).
+  # Requires the btc_15min signal (below) to compute anything; inert
+  # (falls back to waiting on authoritative settlement) without it.
+  - id: btc-dipsnipe-5m-live-1
+    strategy: dip_snipe_3round
+    market:
+      exchange: polymarket
+      slug: "btc-updown-5m"
+      outcome: "UP"
+    mode: live
+    schedule: "every:5s"
+    signals:
+      - name: btc_15min
+    winning_rule:
+      name: polymarket.btc_up_or_down_5m.price_compare
+      params:
+        tolerance_pct: "0.02"
+    params:
+      trigger: "0.30"
+      size: "5"
+      max_rounds: 3
+      min_window_secs: 120
+      slug: "btc-updown-5m"
+      outcome: "UP"
+      exchange: "polymarket"
+    risk:
+      max_position_notional: "20"
+      max_daily_loss: "10"
+      max_orders_per_minute: 5
+    secrets:
+      exchange_credentials: "polymarket.live"
