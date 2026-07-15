@@ -655,8 +655,6 @@ class Supervisor:
 
     async def _check_bots(self) -> None:
         """Inspect all running bots; respawn dead or silent ones."""
-        stale_threshold = 2 * _HEARTBEAT_INTERVAL_S
-
         for bot_id, bp in list(self._running.items()):
             # Check if the process has exited.
             if bp.proc.returncode is not None:
@@ -670,7 +668,12 @@ class Supervisor:
                     self._running.pop(bot_id, None)
                 continue
 
-            # Check heartbeat staleness.
+            # Check heartbeat staleness. A bot only beats once per tick
+            # (BaseBot.run), so the threshold must never be tighter than
+            # 2x that bot's own schedule interval — otherwise any bot with
+            # a tick cadence longer than the generic 2x_HEARTBEAT_INTERVAL_S
+            # floor gets killed before it can ever complete a single tick.
+            stale_threshold = max(2 * _HEARTBEAT_INTERVAL_S, 2 * bp.entry.schedule_seconds())
             health = self._heartbeat_server.health(bot_id)
             if health.age_s > stale_threshold:
                 logger.warning(

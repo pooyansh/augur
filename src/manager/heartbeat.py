@@ -101,6 +101,10 @@ class HeartbeatServer:
         self._beats: dict[str, tuple[datetime, str | None, float]] = {}
         self._servers: dict[str, asyncio.AbstractServer] = {}
         self._started_at: datetime = self._clock.now()
+        # bot_id -> when its socket was (re)bound; used as the "no beat yet"
+        # age baseline instead of server-start time, so a bot (re)spawned
+        # long after the manager itself booted isn't immediately judged stale.
+        self._bound_at: dict[str, datetime] = {}
 
     async def start(self, bot_ids: list[str]) -> None:
         """Bind a UNIX socket for each bot id and begin accepting connections.
@@ -125,6 +129,8 @@ class HeartbeatServer:
         # Remove stale socket from a previous run.
         if sock_path.exists():
             sock_path.unlink()
+
+        self._bound_at[bot_id] = self._clock.now()
 
         _bot_id = bot_id  # capture for closure
 
@@ -220,7 +226,8 @@ class HeartbeatServer:
             last_beat_at = None
             last_error = None
             snap_lag = 0.0
-            age_s = (now - self._started_at).total_seconds()
+            baseline = self._bound_at.get(bot_id, self._started_at)
+            age_s = (now - baseline).total_seconds()
 
         return BotHealth(
             bot_id=bot_id,
@@ -253,6 +260,7 @@ class HeartbeatServer:
         if sock_path.exists():
             sock_path.unlink(missing_ok=True)
         self._beats.pop(bot_id, None)
+        self._bound_at.pop(bot_id, None)
 
     async def close(self) -> None:
         """Close all listening sockets and clean up socket files."""
