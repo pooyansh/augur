@@ -100,8 +100,13 @@ bots:
   # rule can flip-flop, so a wrong fast read can fire an extra real order
   # before the true result is known — corrected after the fact once
   # authoritative settlement confirms it (dip_snipe_3round._pending_validations).
-  # Requires the btc_15min signal (below) to compute anything; inert
-  # (falls back to waiting on authoritative settlement) without it.
+  #
+  # Uses btc_fast (src/signals/btc_fast.py, 20s cadence), not btc_15min —
+  # live-verified btc_15min's 900s cadence never refreshes within this
+  # market's 5-minute window, so the rule stayed UNDECIDED the entire
+  # window and the fast path never engaged. signal_name in winning_rule's
+  # params must match the signal subscribed below; dip_snipe_3round reads
+  # both from the same BotConfig so they can't drift apart.
   - id: btc-dipsnipe-5m-live-1
     strategy: dip_snipe_3round
     market:
@@ -111,11 +116,12 @@ bots:
     mode: live
     schedule: "every:5s"
     signals:
-      - name: btc_15min
+      - name: btc_fast
     winning_rule:
       name: polymarket.btc_up_or_down_5m.price_compare
       params:
         tolerance_pct: "0.02"
+        signal_name: "btc_fast"
     params:
       trigger: "0.30"
       size: "5"

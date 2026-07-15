@@ -33,8 +33,10 @@ Snapshot keys (beyond the BaseBot-mandatory three):
   provisional-rule continuation state, see class docstring
 
 Optional fast-rule continuation (opt-in, see .claude/rules/10-winning-rules.md):
-when a winning_rule is configured in config/bots.yaml and the btc_15min
-signal is subscribed, ``_tick_awaiting_settlement`` no longer blocks
+when a winning_rule is configured in config/bots.yaml and its configured
+BTC price signal is subscribed (btc_fast for 5-minute-or-shorter windows —
+see src/signals/btc_fast.py; btc_15min's 900s cadence is too slow to
+detect a move within one), ``_tick_awaiting_settlement`` no longer blocks
 indefinitely on Polymarket's official closed+winner fields (which can lag
 minutes). After ``FAST_LOSS_STREAK`` consecutive LOST provisional rulings,
 it advances to the next round as if lost, real capital included. This is a
@@ -101,20 +103,23 @@ async def _best_ask(client: httpx.AsyncClient, token_id: str) -> Decimal:
     return min(prices) if prices else Decimal("1")
 
 
-def _btc_price_from_signals(signals: SignalSnapshot | None) -> Decimal | None:
-    """Read the live BTC price from the btc_15min signal, if fresh and present.
+def _btc_price_from_signals(signals: SignalSnapshot | None, signal_name: str) -> Decimal | None:
+    """Read the live BTC price from ``signal_name``, if fresh and present.
 
     Mirrors the same signal/field access as
     ``src/rules/polymarket/btc_up_or_down_5m/price_compare.py`` — needed
     here too so ``current_position()`` can report an ``entry_reference``
-    for that rule to compare against. Returns ``None`` if the signal isn't
-    configured, is stale, or doesn't parse — the fast-rule feature is
-    inert in that case, not an error.
+    for that rule to compare against; ``signal_name`` must match the
+    ``winning_rule.params.signal_name`` configured for this bot (see that
+    rule's docstring — ``btc_15min``'s 900s cadence is too slow to detect
+    a move within a 5-minute window; use ``btc_fast`` for 5-min bots).
+    Returns ``None`` if the signal isn't configured, is stale, or doesn't
+    parse — the fast-rule feature is inert in that case, not an error.
     """
-    if signals is None or "btc_15min" in signals.stale or "btc_15min" not in signals.samples:
+    if signals is None or signal_name in signals.stale or signal_name not in signals.samples:
         return None
     try:
-        return Decimal(str(signals.samples["btc_15min"]["price_usd"]))
+        return Decimal(str(signals.samples[signal_name]["price_usd"]))
     except (KeyError, TypeError, InvalidOperation):
         return None
 
@@ -198,6 +203,10 @@ class DipSnipe3Round(BaseBot):
         self._size = Decimal(str(p.get("size", self.SIZE)))
         self._max_rounds = int(p.get("max_rounds", self.MAX_ROUNDS))
         self._min_window_secs = int(p.get("min_window_secs", self.MIN_WINDOW_SECS))
+        # Must match the winning_rule's own signal_name param (see
+        # src/rules/polymarket/btc_up_or_down_5m/price_compare.py) — read
+        # from the same config source so the two can never drift apart.
+        self._btc_signal_name = str(config.winning_rule_params.get("signal_name", "btc_15min"))
         self._ref = MarketRef(
             exchange=cast(
                 Literal["polymarket", "kalshi", "echo"], str(p.get("exchange", market.venue))
@@ -346,7 +355,7 @@ class DipSnipe3Round(BaseBot):
                 self._fired_token = token_id
                 self._fired_outcome = outcome_name
                 self._entry_price = ask
-                self._entry_btc_price = _btc_price_from_signals(signals)
+                self._entry_btc_price = _btc_price_from_signals(signals, self._btc_signal_name)
                 self._entry_at = self._deps.clock.now()
                 self._pending_coid = self._peek_next_client_order_id()
                 self._awaiting_fill_since = time.time()

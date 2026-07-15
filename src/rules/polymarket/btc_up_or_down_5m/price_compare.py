@@ -31,7 +31,7 @@ from typing import ClassVar
 from src.rules.base import ProvisionalRuling, WinningRule, WinningRuleContext
 from src.rules.registry import winning_rule
 
-_SIGNAL_NAME = "btc_15min"
+_DEFAULT_SIGNAL_NAME = "btc_15min"
 
 
 @winning_rule
@@ -43,6 +43,14 @@ class PriceCompare(WinningRule):
             for 0.05%). The price must have moved by more than this percentage
             from ``entry_reference`` before the rule commits to WON/LOST.
             Defaults to ``Decimal("0")`` (any nonzero move commits).
+        signal_name: Which BTC price signal to read. Defaults to
+            ``"btc_15min"`` for backwards compatibility, but that signal's
+            900s cadence is structurally too slow to detect a price move
+            within a 5-minute market window (found live: the rule stayed
+            UNDECIDED for an entire window because the "live" sample never
+            changed) — bots on 5-minute-or-shorter windows should set this
+            to ``"btc_fast"`` (``src/signals/btc_fast.py``, 20s cadence)
+            and subscribe to it in their ``config/bots.yaml`` entry.
     """
 
     name: ClassVar[str] = "polymarket.btc_up_or_down_5m.price_compare"
@@ -54,16 +62,18 @@ class PriceCompare(WinningRule):
             ctx: Position, signals, clock, and params for this evaluation.
 
         Returns:
-            ``ProvisionalRuling.UNDECIDED`` if the ``btc_15min`` signal is
-            missing or stale, if ``entry_reference`` is not positive, or if
-            the price move is within ``tolerance_pct`` of the entry
-            reference. Otherwise ``WON`` if the price moved in the held
-            side's favor, ``LOST`` if against it.
+            ``ProvisionalRuling.UNDECIDED`` if the configured signal (see
+            ``signal_name`` param) is missing or stale, if
+            ``entry_reference`` is not positive, or if the price move is
+            within ``tolerance_pct`` of the entry reference. Otherwise
+            ``WON`` if the price moved in the held side's favor, ``LOST``
+            if against it.
         """
-        if _SIGNAL_NAME in ctx.signals.stale or _SIGNAL_NAME not in ctx.signals.samples:
+        signal_name = str(ctx.params.get("signal_name", _DEFAULT_SIGNAL_NAME))
+        if signal_name in ctx.signals.stale or signal_name not in ctx.signals.samples:
             return ProvisionalRuling.UNDECIDED
 
-        sample = ctx.signals.samples[_SIGNAL_NAME]
+        sample = ctx.signals.samples[signal_name]
         try:
             price = Decimal(str(sample["price_usd"]))
         except (KeyError, TypeError, InvalidOperation):
