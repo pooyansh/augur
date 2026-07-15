@@ -27,7 +27,7 @@ CONDITION_ID = "0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84
 TOKEN_ID_YES = "71321045679252212594626385532706912750332728571942532289631379312455583992563"
 TOKEN_ID_NO = "52114319501245915516055106046884209969926127482827954674443846427813813222426"
 
-WALLET_ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+WALLET_ADDRESS = "0x4Cc43Cb95f84Bc2df3357390b87f7dB7ccab5F03"
 EXCHANGE_ORDER_ID = "0xabc123def456abc123def456abc123def456abc123def456abc123def456abc12"
 
 # ---------------------------------------------------------------------------
@@ -244,13 +244,18 @@ CLOB_OPEN_ORDERS: list[dict[str, Any]] = [
 # Helper: build a PolymarketConfig for tests (no real secrets needed)
 # ---------------------------------------------------------------------------
 
-_TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+_TEST_PRIVATE_KEY = "0x34903243d41f5a29789e3d5a5f87912f8dd13a0b4618148778d4bdce62e31d8f"
 
 
 def make_test_config() -> dict[str, Any]:
     """Return a dict suitable for constructing PolymarketConfig in tests.
 
-    Uses Hardhat account #0 private key — never use on mainnet.
+    A throwaway keypair generated solely for this fixture (paired with
+    ``WALLET_ADDRESS`` above) — never a real wallet, never use on mainnet.
+    Deliberately not one of Hardhat/Anvil's published default accounts:
+    those exact keys are catalogued by GitHub's secret scanner (and others)
+    as "private key" matches even though they hold no real funds, which
+    generates recurring false-positive alerts on this repo.
 
     Returns:
         Dict of all PolymarketConfig fields.
