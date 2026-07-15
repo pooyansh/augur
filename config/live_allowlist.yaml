@@ -1,0 +1,12 @@
+# config/live_allowlist.yaml — manager-level live-trading allow-list.
+#
+# NOT a secret (just a list of bot ids) but gates real-money order placement
+# per the three-lock rule (CLAUDE.md invariant 1). Bind-mounted read-only to
+# /run/secrets/live_allowlist.yaml (docker-compose.yml) so it lands where
+# src/manager/__main__.py::_load_live_allowlist expects it, read once at
+# manager process startup.
+#
+# A bot id here does NOT make it live by itself — mode: live must also be
+# set on that bot's entry in config/bots.yaml.
+bot_ids:
+  - btc-dipsnipe-5m-live-1

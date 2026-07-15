@@ -46,6 +46,13 @@ services:
         source: ./config
         target: /app/config
         read_only: true
+      # Live-trading allow-list — non-secret (bot ids only), but lands in
+      # /run/secrets because that's where _load_live_allowlist() reads it
+      # from at manager startup (three-lock rule, CLAUDE.md invariant 1).
+      - type: bind
+        source: ./config/live_allowlist.yaml
+        target: /run/secrets/live_allowlist.yaml
+        read_only: true
     ports:
       # Operator dashboard — loopback-only, per .claude/rules/06b-dashboard.md
       # invariant 4. Reach it via `ssh -L 8090:127.0.0.1:8090 user@vps`.
