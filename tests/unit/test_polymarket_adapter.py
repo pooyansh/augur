@@ -787,3 +787,96 @@ def test_hypothesis_paper_buy_fill_never_better_than_best_ask(
         if isinstance(fill, FillEvent):
             # Fill price must be exactly best_ask (far touch) — never better for BUY
             assert fill.fill_price == best_ask
+
+
+# ---------------------------------------------------------------------------
+# 19. Geoblock pre-flight check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio()
+async def test_geoblock_precheck_blocked_short_circuits(
+    live_adapter: PolymarketAdapter,
+    buy_intent: OrderIntent,
+) -> None:
+    """blocked=true from the pre-flight check rejects without calling /order."""
+    live_adapter._reconcile_failed = False
+    live_adapter._signing = MagicMock()
+    live_adapter._signing.sign_order = MagicMock(return_value=MagicMock(to_wire=lambda: {}))
+    live_adapter._signing.build_l2_headers = MagicMock(return_value={})
+
+    with respx.mock(assert_all_mocked=True) as mock:
+        # No /order route registered — a call to it would raise and fail the test.
+        mock.get("https://polymarket.com/api/geoblock").mock(
+            return_value=httpx.Response(
+                200,
+                json={"blocked": True, "ip": "1.2.3.4", "country": "US", "region": "NY"},
+            )
+        )
+        live_adapter._http = httpx.AsyncClient()
+        result = await live_adapter._place_live(buy_intent)
+        await live_adapter._http.aclose()
+
+    assert result.accepted is False
+    assert result.exchange_order_id is None
+    assert "geoblock" in (result.reason or "").lower()
+
+
+@pytest.mark.asyncio()
+async def test_geoblock_precheck_not_blocked_proceeds_to_order(
+    live_adapter: PolymarketAdapter,
+    buy_intent: OrderIntent,
+) -> None:
+    """blocked=false from the pre-flight check still submits the real order."""
+    live_adapter._reconcile_failed = False
+    live_adapter._signing = MagicMock()
+    live_adapter._signing.sign_order = MagicMock(return_value=MagicMock(to_wire=lambda: {}))
+    live_adapter._signing.build_l2_headers = MagicMock(return_value={})
+
+    with respx.mock(assert_all_mocked=True) as mock:
+        mock.get("https://polymarket.com/api/geoblock").mock(
+            return_value=httpx.Response(
+                200,
+                json={"blocked": False, "ip": "1.2.3.4", "country": "CA", "region": "ON"},
+            )
+        )
+        mock.post(f"{live_adapter._config.clob_host}/order").mock(
+            return_value=httpx.Response(
+                200,
+                json={"orderID": "0xdeadbeef"},
+                headers={"content-type": "application/json"},
+            )
+        )
+        live_adapter._http = httpx.AsyncClient()
+        result = await live_adapter._place_live(buy_intent)
+        await live_adapter._http.aclose()
+
+    assert result.accepted is True
+    assert result.exchange_order_id == "0xdeadbeef"
+
+
+@pytest.mark.asyncio()
+async def test_geoblock_precheck_failure_fails_open(
+    live_adapter: PolymarketAdapter,
+    buy_intent: OrderIntent,
+) -> None:
+    """A broken/unreachable pre-flight check never blocks order placement."""
+    live_adapter._reconcile_failed = False
+    live_adapter._signing = MagicMock()
+    live_adapter._signing.sign_order = MagicMock(return_value=MagicMock(to_wire=lambda: {}))
+    live_adapter._signing.build_l2_headers = MagicMock(return_value={})
+
+    with respx.mock(assert_all_mocked=True) as mock:
+        mock.get("https://polymarket.com/api/geoblock").mock(return_value=httpx.Response(500))
+        mock.post(f"{live_adapter._config.clob_host}/order").mock(
+            return_value=httpx.Response(
+                200,
+                json={"orderID": "0xdeadbeef"},
+                headers={"content-type": "application/json"},
+            )
+        )
+        live_adapter._http = httpx.AsyncClient()
+        result = await live_adapter._place_live(buy_intent)
+        await live_adapter._http.aclose()
+
+    assert result.accepted is True

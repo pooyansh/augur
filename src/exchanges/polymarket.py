@@ -432,10 +432,53 @@ class PolymarketAdapter(ExchangeAdapter):
 
         return await self._place_live(intent)
 
+    async def _check_geoblock(self) -> dict[str, Any] | None:
+        """Query Polymarket's own geoblock check immediately before an order.
+
+        ``https://polymarket.com/api/geoblock`` is the same check the
+        Polymarket frontend uses to decide whether to show the
+        region-restricted banner. It's on a different host than the CLOB
+        order-placement endpoint (``clob.polymarket.com``) and may use a
+        different/stricter list, so a ``blocked: false`` result here is a
+        useful diagnostic signal but not a guarantee ``POST /order`` will be
+        accepted — logged for correlation, not treated as authoritative.
+
+        Returns:
+            The parsed JSON body (``{"blocked": bool, "ip": str,
+            "country": str, "region": str}``), or ``None`` if the check
+            itself failed. A failed check never blocks order placement —
+            this is diagnostic-only, not a hard gate.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.get("https://polymarket.com/api/geoblock")
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+        except Exception as exc:
+            logger.debug("polymarket_geoblock_check_failed", extra={"error": str(exc)})
+            return None
+
     async def _place_live(self, intent: OrderIntent) -> OrderResult:
         """Build, sign, and submit an EIP-712 order to the CLOB."""
         assert self._http is not None
         assert self._signing is not None
+
+        geoblock = await self._check_geoblock()
+        if geoblock is not None:
+            logger.info("polymarket_geoblock_precheck", extra=geoblock)
+            if geoblock.get("blocked") is True:
+                return OrderResult(
+                    client_order_id=intent.client_order_id,
+                    exchange_order_id=None,
+                    accepted=False,
+                    reason=(
+                        f"[auth] Pre-flight geoblock check reported blocked=true "
+                        f"(ip={geoblock.get('ip')}, country={geoblock.get('country')}) "
+                        "— order not submitted."
+                    ),
+                    raw={"error": "geoblock_precheck", **geoblock},
+                )
 
         try:
             signed = self._signing.sign_order(intent)
